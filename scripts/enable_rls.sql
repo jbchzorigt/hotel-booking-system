@@ -344,6 +344,35 @@ CREATE POLICY police_realm_only ON police_matches
   USING       (app_realm() = 'police')
   WITH CHECK  (app_realm() = 'police');
 
+-- Police officer identity + audit log arrive in a LATER revision than this
+-- script's first run, so guard on existence: the RLS revision (a1b2c3d4e5f6)
+-- must skip them on a fresh install; the revision that CREATES the tables
+-- re-runs this script and applies the block.
+DO $$
+BEGIN
+  IF to_regclass('public.police_officers') IS NOT NULL THEN
+    GRANT SELECT, INSERT, UPDATE ON police_officers TO police_runtime;
+    REVOKE ALL ON police_officers FROM app_runtime;
+    ALTER TABLE police_officers ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE police_officers FORCE  ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS police_realm_only ON police_officers;
+    CREATE POLICY police_realm_only ON police_officers
+      FOR ALL USING (app_realm() = 'police') WITH CHECK (app_realm() = 'police');
+  END IF;
+
+  IF to_regclass('public.police_audit_logs') IS NOT NULL THEN
+    -- Append-only: INSERT + SELECT, never UPDATE/DELETE.
+    GRANT SELECT, INSERT ON police_audit_logs TO police_runtime;
+    REVOKE ALL ON police_audit_logs FROM app_runtime;
+    ALTER TABLE police_audit_logs ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE police_audit_logs FORCE  ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS police_realm_only ON police_audit_logs;
+    CREATE POLICY police_realm_only ON police_audit_logs
+      FOR ALL USING (app_realm() = 'police') WITH CHECK (app_realm() = 'police');
+  END IF;
+END
+$$;
+
 -- ---------------------------------------------------------------------------
 -- 7. Marketplace realm — the PUBLIC, unauthenticated guest surface
 -- ---------------------------------------------------------------------------
@@ -397,6 +426,68 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
     );
 $$;
 ALTER FUNCTION tenant_available_rooms(uuid, date, date) OWNER TO rls_exempt;
+
+-- ---------------------------------------------------------------------------
+-- 8. Platform-admin REDACTED police-alert projection
+-- ---------------------------------------------------------------------------
+-- The police realm is invisible to app_runtime (grants revoked above). But
+-- the platform operator has a legitimate need to SEE that matches are
+-- happening — WITHOUT breaching the realm or ever touching raw РД.
+--
+-- This SECURITY DEFINER function (owner = rls_exempt, BYPASSRLS) reads
+-- police_matches and returns METADATA ONLY: who was flagged, which hotel /
+-- room / booking, when, and the review status. It never exposes the raw
+-- registry number (which is not stored anywhere) NOR the registry_hash.
+--
+-- Two locks keep this from becoming a leak despite EXECUTE being granted to
+-- the shared app_runtime role:
+--   (a) the WHERE app_is_platform_admin() guard — a hotel/restaurant/
+--       reception session (app.user_role != 'PLATFORM_ADMIN') gets ZERO
+--       rows, even though it can call the function;
+--   (b) the function returns a fixed, redacted column set — callers cannot
+--       widen it.
+-- SECURITY DEFINER changes the executing ROLE, not the session GUCs, so
+-- app_is_platform_admin() still reflects the true caller.
+GRANT SELECT ON police_matches, wanted_persons, tenants, rooms, bookings
+  TO rls_exempt;
+
+CREATE OR REPLACE FUNCTION admin_police_alerts(p_limit int DEFAULT 100)
+RETURNS TABLE (
+  match_id uuid,
+  matched_at timestamptz,
+  status text,
+  wanted_full_name text,
+  case_reference text,
+  tenant_id uuid,
+  hotel_name text,
+  room_number text,
+  booking_code text,
+  guest_full_name text
+)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT
+    pm.id,
+    pm.matched_at,
+    pm.status::text,
+    wp.full_name,
+    wp.case_reference,
+    pm.tenant_id,
+    t.name,
+    r.room_number,
+    b.code,
+    b.guest_full_name
+  FROM police_matches pm
+  JOIN wanted_persons wp ON wp.id = pm.wanted_person_id
+  JOIN bookings b        ON b.id  = pm.booking_id
+  JOIN rooms r           ON r.id  = b.room_id
+  JOIN tenants t         ON t.id  = pm.tenant_id
+  WHERE app_is_platform_admin()          -- the guard: no rows for non-admins
+  ORDER BY pm.matched_at DESC
+  LIMIT GREATEST(COALESCE(p_limit, 100), 0);
+$$;
+ALTER FUNCTION admin_police_alerts(int) OWNER TO rls_exempt;
+REVOKE ALL ON FUNCTION admin_police_alerts(int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION admin_police_alerts(int) TO app_runtime;
 
 COMMIT;
 

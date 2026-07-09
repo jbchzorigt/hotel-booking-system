@@ -454,3 +454,114 @@ export interface NewFoodOrderEvent {
 }
 
 export type RestaurantWsEvent = NewFoodOrderEvent | { type: string };
+
+// --- Police realm (app/api/police_router.py + police_service.py) -----------
+export type PoliceMatchStatus = "PENDING_REVIEW" | "CONFIRMED" | "DISMISSED";
+
+/** Watchlist-entry lifecycle. `is_active` is the flag the matcher gates on. */
+export type WantedPersonStatus = "WANTED" | "ARRESTED" | "CLEARED";
+
+/** What an officer did when resolving a match. */
+export type PoliceResolutionAction = "ARRESTED" | "CONFIRMED" | "DISMISSED";
+
+/** POST /police/login — PoliceTokenResponse. */
+export interface PoliceLoginResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  realm: "police";
+  officer_id: string;
+  full_name: string;
+}
+
+/** GET /police/watchlist / POST /police/watchlist — WantedPersonOut.
+ *  Redacted: carries the state-verified identity, NEVER the registry
+ *  number or its hash (the raw РД is never stored). */
+export interface WantedPerson {
+  id: string;
+  full_name: string;
+  district: string | null;
+  address: string | null;
+  case_reference: string | null;
+  status: WantedPersonStatus;
+  is_active: boolean;
+  created_at: string;
+}
+
+/** GET /police/matches — MatchOut. Registry numbers are NEVER exposed:
+ *  the system stores only a salted hash, so no plaintext РД exists. */
+export interface PoliceMatch {
+  match_id: string;
+  status: PoliceMatchStatus;
+  matched_at: string;
+  wanted_full_name: string;
+  case_reference: string | null;
+  district: string | null;
+  wanted_status: WantedPersonStatus;
+  hotel_name: string;
+  hotel_address: string | null;
+  hotel_maps_lat: number;
+  hotel_maps_lng: number;
+  room_number: string;
+  booking_code: string;
+  guest_full_name: string;
+  check_in_date: string;
+  check_out_date: string;
+  reviewed_at: string | null;
+  review_note: string | null;
+}
+
+/** POST /police/matches/{id}/resolve — ResolveResponse. */
+export interface ResolveResponse {
+  match_id: string;
+  status: PoliceMatchStatus;
+  action: PoliceResolutionAction;
+  wanted_status: WantedPersonStatus;
+  reviewed_at: string;
+}
+
+/** GET /police/audit-logs — AuditLogOut. Never exposes a registry number. */
+export interface PoliceAuditLog {
+  id: string;
+  created_at: string;
+  action: string;
+  officer_name: string | null;
+  target_person_name: string | null;
+  match_id: string | null;
+  note: string | null;
+}
+
+/** /ws/police/alerts payload. A new match is always PENDING_REVIEW and the
+ *  alert omits status/stay dates (fetch /police/matches for the full row). */
+export interface PoliceMatchAlert {
+  type: "POLICE_MATCH_ALERT";
+  match_id: string;
+  matched_at: string;
+  wanted_full_name: string;
+  case_reference: string | null;
+  booking_code: string;
+  guest_full_name: string;
+  hotel_name: string;
+  hotel_address: string | null;
+  hotel_maps_lat: number;
+  hotel_maps_lng: number;
+  room_number: string;
+}
+
+export type PoliceWsEvent = PoliceMatchAlert | { type: string };
+
+// --- Admin police-alerts projection (app/api/admin_router.py) --------------
+// REDACTED metadata for the platform operator: no registry number, no hash.
+// The authoritative dispatch surface is the police realm's /police/matches.
+export interface AdminPoliceAlert {
+  match_id: string;
+  matched_at: string;
+  status: PoliceMatchStatus;
+  wanted_full_name: string;
+  case_reference: string | null;
+  tenant_id: string;
+  hotel_name: string;
+  room_number: string;
+  booking_code: string;
+  guest_full_name: string;
+}

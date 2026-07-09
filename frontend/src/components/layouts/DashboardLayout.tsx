@@ -12,6 +12,7 @@ import {
   Loader2,
   LogOut,
   Menu,
+  ShieldAlert,
   Sparkles,
   X,
   type LucideIcon,
@@ -30,6 +31,7 @@ interface NavItem {
 const NAV_BY_ROLE: Record<UserRole, NavItem[]> = {
   PLATFORM_ADMIN: [
     { href: "/admin", label: "Overview", icon: LayoutDashboard },
+    { href: "/admin/police", label: "Police Alerts", icon: ShieldAlert },
   ],
   HOTEL_ADMIN: [
     { href: "/hotel", label: "Overview", icon: LayoutDashboard },

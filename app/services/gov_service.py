@@ -96,6 +96,8 @@ class KhurCitizen:
     registry_number: str
     full_name: str
     address: str
+    #: District (дүүрэг). Optional — legacy responses may omit it.
+    district: str | None = None
 
 
 class KhurApiPort(Protocol):
@@ -152,6 +154,7 @@ class MockKhurApi:
             registry_number=rn,
             full_name=f"{surname} {name}",
             address=f"Улаанбаатар, {district}, {building}-р байр, {apartment} тоот",
+            district=district,
         )
 
 
@@ -196,6 +199,7 @@ class HttpKhurApi:
                 registry_number=rn,
                 full_name=payload["full_name"],
                 address=payload["address"],
+                district=payload.get("district"),
             )
         except KeyError as exc:
             raise GovUpstreamError(f"KHUR response missing field {exc}") from exc

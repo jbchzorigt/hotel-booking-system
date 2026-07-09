@@ -19,13 +19,13 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from pydantic import BaseModel
-from sqlalchemy import case, func, select
+from sqlalchemy import bindparam, case, func, select, text
 
 from app.dependencies.auth import AuthContext, ScopedSession, require_roles
 from app.models.domain import (
@@ -73,6 +73,28 @@ class TopRoom(BaseModel):
     #: Bookings that held or moved money (CANCELLED/NO_SHOW excluded).
     demand: int
     gross_revenue: Decimal
+
+
+class PoliceAlertOut(BaseModel):
+    """
+    REDACTED police-match view for the platform operator dashboard.
+
+    Metadata only — enough to see that screening is working and where a
+    hit occurred, deliberately WITHOUT the raw registry number (never
+    stored) or the registry_hash. The authoritative dispatch surface
+    remains the police realm's own ``GET /api/v1/police/matches``.
+    """
+
+    match_id: uuid.UUID
+    matched_at: datetime
+    status: str
+    wanted_full_name: str
+    case_reference: str | None
+    tenant_id: uuid.UUID
+    hotel_name: str
+    room_number: str
+    booking_code: str
+    guest_full_name: str
 
 
 # ===========================================================================
@@ -297,3 +319,34 @@ async def export_revenue(ctx: AdminCtx, session: ScopedSession) -> StreamingResp
         media_type=_XLSX_MEDIA_TYPE,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ===========================================================================
+# GET /police-alerts — redacted, admin-visible projection of police matches
+# ===========================================================================
+_POLICE_ALERTS_SQL = text(
+    "SELECT match_id, matched_at, status, wanted_full_name, case_reference, "
+    "tenant_id, hotel_name, room_number, booking_code, guest_full_name "
+    "FROM admin_police_alerts(:limit)"
+).bindparams(bindparam("limit"))
+
+
+@router.get("/police-alerts", response_model=list[PoliceAlertOut])
+async def list_police_alerts(
+    ctx: AdminCtx,
+    session: ScopedSession,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> list[PoliceAlertOut]:
+    """
+    Newest-first police matches, redacted for the platform operator.
+
+    Reads through the ``admin_police_alerts`` SECURITY DEFINER function:
+    the platform admin's own DB role (``app_runtime``) has NO grants on the
+    police tables, so this controlled projection — metadata only, no raw
+    registry number — is the sole way platform-realm sessions can observe
+    that screening is producing hits. The function's internal
+    ``app_is_platform_admin()`` guard means a non-admin app session calling
+    it would get nothing.
+    """
+    rows = (await session.execute(_POLICE_ALERTS_SQL, {"limit": limit})).all()
+    return [PoliceAlertOut(**row._mapping) for row in rows]

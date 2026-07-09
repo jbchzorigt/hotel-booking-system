@@ -24,8 +24,11 @@ from app.models.domain import (
     MinibarItem,
     PlatformAccount,
     PlatformLedgerEntry,
+    PoliceAuditLog,
     PoliceMatch,
     PoliceMatchStatus,
+    PoliceOfficer,
+    PoliceResolutionAction,
     Restaurant,
     Room,
     RoomState,
@@ -35,6 +38,7 @@ from app.models.domain import (
     User,
     UserRole,
     WantedPerson,
+    WantedPersonStatus,
 )
 
 __all__ = [
@@ -55,8 +59,11 @@ __all__ = [
     "MinibarItem",
     "PlatformAccount",
     "PlatformLedgerEntry",
+    "PoliceAuditLog",
     "PoliceMatch",
     "PoliceMatchStatus",
+    "PoliceOfficer",
+    "PoliceResolutionAction",
     "Restaurant",
     "Room",
     "RoomState",
@@ -66,4 +73,5 @@ __all__ = [
     "User",
     "UserRole",
     "WantedPerson",
+    "WantedPersonStatus",
 ]
