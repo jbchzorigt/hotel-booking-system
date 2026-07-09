@@ -1,0 +1,63 @@
+# ===========================================================================
+# Local development infrastructure — PostgreSQL 16 + Redis 7
+# ===========================================================================
+# Matches the credentials in `.env` and `tests/integration_test.py` exactly.
+#
+#   docker compose up -d
+#
+# First-boot provisioning (empty volume only): `scripts/initdb/` creates the
+# app database (`hotel_marketplace`) and the E2E scratch database
+# (`hotel_marketplace_test`). Schema, RLS policies and the low-privilege
+# runtime roles (`app_runtime`, `police_runtime`) come from Alembic:
+#
+#   MIGRATIONS_DATABASE_URL='postgresql+psycopg://hotel:PyJQHYDjvBWevPD46KVV25Z5OFdS055O@localhost:55440/hotel_marketplace' \
+#     alembic upgrade head
+#
+# NOTE: port 55440 (not 5432) on the host — deliberate, so this stack never
+# collides with a system PostgreSQL. All app config points at 55440.
+# ===========================================================================
+
+name: hotel-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hotel-platform-postgres
+    environment:
+      # Cluster superuser = schema OWNER. The app itself connects as the
+      # low-privilege `app_runtime` role (RLS applies to it); this owner
+      # account is for migrations and psql maintenance only.
+      POSTGRES_USER: hotel
+      POSTGRES_PASSWORD: PyJQHYDjvBWevPD46KVV25Z5OFdS055O
+      POSTGRES_DB: hotel_platform
+    ports:
+      - "55440:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Runs once, on an empty data volume: creates the extra databases.
+      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hotel -d hotel_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: hotel-platform-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

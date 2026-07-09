@@ -1,0 +1,69 @@
+"""
+ORM model registry.
+
+Import every model here so that ``Base.metadata`` is fully populated the
+moment ``app.models`` is imported — required for Alembic autogenerate and
+for ``create_all`` in test fixtures.
+"""
+
+from app.models.base import Base
+from app.models.domain import (
+    Booking,
+    BookingStatus,
+    ContactRequest,
+    ContactRequestStatus,
+    EscrowStatus,
+    FoodItem,
+    FoodOrder,
+    FoodOrderItem,
+    FoodOrderStatus,
+    LedgerDirection,
+    LedgerSourceType,
+    MinibarCategory,
+    MinibarConsumption,
+    MinibarItem,
+    PlatformAccount,
+    PlatformLedgerEntry,
+    PoliceMatch,
+    PoliceMatchStatus,
+    Restaurant,
+    Room,
+    RoomState,
+    RoomType,
+    SubscriptionPlan,
+    Tenant,
+    User,
+    UserRole,
+    WantedPerson,
+)
+
+__all__ = [
+    "Base",
+    "Booking",
+    "BookingStatus",
+    "ContactRequest",
+    "ContactRequestStatus",
+    "EscrowStatus",
+    "FoodItem",
+    "FoodOrder",
+    "FoodOrderItem",
+    "FoodOrderStatus",
+    "LedgerDirection",
+    "LedgerSourceType",
+    "MinibarCategory",
+    "MinibarConsumption",
+    "MinibarItem",
+    "PlatformAccount",
+    "PlatformLedgerEntry",
+    "PoliceMatch",
+    "PoliceMatchStatus",
+    "Restaurant",
+    "Room",
+    "RoomState",
+    "RoomType",
+    "SubscriptionPlan",
+    "Tenant",
+    "User",
+    "UserRole",
+    "WantedPerson",
+]
