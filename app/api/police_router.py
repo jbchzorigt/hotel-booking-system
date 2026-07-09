@@ -29,6 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.core.config import settings
 from app.core.database import police_session
@@ -151,6 +152,22 @@ class ResolveResponse(BaseModel):
     action: PoliceResolutionAction
     wanted_status: WantedPersonStatus
     reviewed_at: datetime
+
+
+# ===========================================================================
+# Schemas — Audit log
+# ===========================================================================
+class AuditLogOut(BaseModel):
+    """Immutable officer-action record joined with the officer's name and the
+    target person's name. PII-free: never a registry number."""
+
+    id: uuid.UUID
+    created_at: datetime
+    action: str
+    officer_name: str | None
+    target_person_name: str | None
+    match_id: uuid.UUID | None
+    note: str | None
 
 
 # ===========================================================================
@@ -413,3 +430,37 @@ async def resolve_match(
         ),
         reviewed_at=now,
     )
+
+
+# ===========================================================================
+# Audit log — GET /police/audit-logs
+# ===========================================================================
+@router.get("/audit-logs", response_model=list[AuditLogOut])
+async def list_audit_logs(
+    ctx: PoliceCtx,
+    session: ScopedSession,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> list[AuditLogOut]:
+    """The append-only officer-action trail, newest first. Joins the actor
+    and the target person by name (both police-realm tables). Never exposes
+    a registry number — the log itself only ever stored ids and notes."""
+    officer = aliased(PoliceOfficer)
+    person = aliased(WantedPerson)
+    rows = (
+        await session.execute(
+            select(
+                PoliceAuditLog.id,
+                PoliceAuditLog.created_at,
+                PoliceAuditLog.action,
+                officer.full_name.label("officer_name"),
+                person.full_name.label("target_person_name"),
+                PoliceAuditLog.match_id,
+                PoliceAuditLog.note,
+            )
+            .outerjoin(officer, PoliceAuditLog.officer_id == officer.id)
+            .outerjoin(person, PoliceAuditLog.target_person_id == person.id)
+            .order_by(PoliceAuditLog.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    return [AuditLogOut(**row._mapping) for row in rows]
