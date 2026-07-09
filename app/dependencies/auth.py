@@ -85,8 +85,15 @@ def _context_from_claims(claims: TokenClaims) -> AuthContext:
     if realm == "police":
         if role != POLICE_ROLE or claims.tenant_id or claims.restaurant_id:
             raise TokenError("inconsistent police-realm claims")
+        # Carry the officer id when the subject is a real officer UUID (from
+        # POST /police/login) — needed for audit attribution. Externally
+        # minted tokens may use non-UUID subjects; those degrade to None.
+        try:
+            officer_id: uuid.UUID | None = uuid.UUID(claims.subject)
+        except (ValueError, TypeError):
+            officer_id = None
         return AuthContext(
-            user_id=None, realm=realm, role=role,
+            user_id=officer_id, realm=realm, role=role,
             tenant_id=None, restaurant_id=None,
         )
 

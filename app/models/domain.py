@@ -186,6 +186,23 @@ class PoliceMatchStatus(str, enum.Enum):
     DISMISSED = "DISMISSED"
 
 
+class WantedPersonStatus(str, enum.Enum):
+    """Lifecycle of a watchlist entry (descriptive; ``is_active`` remains
+    the flag the matcher actually gates on)."""
+
+    WANTED = "WANTED"
+    ARRESTED = "ARRESTED"
+    CLEARED = "CLEARED"      # de-listed / false lead
+
+
+class PoliceResolutionAction(str, enum.Enum):
+    """What an officer did with a match when resolving it."""
+
+    ARRESTED = "ARRESTED"    # genuine hit + suspect apprehended
+    CONFIRMED = "CONFIRMED"  # genuine hit, no arrest (yet)
+    DISMISSED = "DISMISSED"  # false positive
+
+
 class ContactRequestStatus(str, enum.Enum):
     """Sales pipeline for hotel onboarding leads."""
 
@@ -756,8 +773,17 @@ class WantedPerson(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     registry_hash: Mapped[str] = mapped_column(String(128), unique=True)
     full_name: Mapped[str]
     address: Mapped[str | None] = mapped_column(Text)
+    #: District (дүүрэг) as returned by KHUR — a first-class dispatch field.
+    district: Mapped[str | None] = mapped_column(String(120))
     case_reference: Mapped[str | None] = mapped_column(String(64))
-    #: De-listed persons stay for audit but stop producing matches.
+    #: Descriptive lifecycle (WANTED -> ARRESTED / CLEARED).
+    status: Mapped[WantedPersonStatus] = mapped_column(
+        _pg_enum(WantedPersonStatus, "wanted_person_status"),
+        default=WantedPersonStatus.WANTED,
+        index=True,
+    )
+    #: The flag the matcher gates on. An arrest sets this False so the
+    #: person stops producing new matches, while ``status`` records why.
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
     matches: Mapped[list["PoliceMatch"]] = relationship(
@@ -811,3 +837,57 @@ class PoliceMatch(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     review_note: Mapped[str | None] = mapped_column(Text)
 
     wanted_person: Mapped[WantedPerson] = relationship(back_populates="matches")
+
+
+class PoliceOfficer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """
+    A police officer account — the police realm's OWN identity store.
+
+    Deliberately NOT a row in ``users``: police principals are not hotel
+    staff, the ``UserRole`` enum has no POLICE member, and the police realm
+    must stay isolated from the app's user table. Only ``police_runtime``
+    (realm='police') can read this table; app credentials hold no grants.
+    """
+
+    __tablename__ = "police_officers"
+
+    badge_number: Mapped[str] = mapped_column(String(32), unique=True)
+    hashed_password: Mapped[str]
+    full_name: Mapped[str]
+    rank: Mapped[str | None] = mapped_column(String(64))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_login_at: Mapped[datetime | None]
+
+    audit_logs: Mapped[list["PoliceAuditLog"]] = relationship(
+        back_populates="officer"
+    )
+
+
+class PoliceAuditLog(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """
+    Append-only record of officer actions (arrests, dismissals, watchlist
+    edits). Police-realm only; never updated or deleted.
+
+    ``officer_id`` is ``SET NULL`` on officer deletion so the historical
+    action survives even if the account is later removed.
+    """
+
+    __tablename__ = "police_audit_logs"
+
+    officer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("police_officers.id", ondelete="SET NULL"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    #: Who the action was about (a watchlist entry), if applicable.
+    target_person_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("wanted_persons.id", ondelete="SET NULL"), index=True
+    )
+    #: The match that triggered the action, if applicable.
+    match_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("police_matches.id", ondelete="SET NULL")
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+
+    officer: Mapped["PoliceOfficer | None"] = relationship(
+        back_populates="audit_logs"
+    )

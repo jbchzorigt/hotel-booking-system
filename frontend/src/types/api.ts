@@ -454,3 +454,62 @@ export interface NewFoodOrderEvent {
 }
 
 export type RestaurantWsEvent = NewFoodOrderEvent | { type: string };
+
+// --- Police realm (app/api/police_router.py + police_service.py) -----------
+export type PoliceMatchStatus = "PENDING_REVIEW" | "CONFIRMED" | "DISMISSED";
+
+/** GET /police/matches — MatchOut. Registry numbers are NEVER exposed:
+ *  the system stores only a salted hash, so no plaintext РД exists. */
+export interface PoliceMatch {
+  match_id: string;
+  status: PoliceMatchStatus;
+  matched_at: string;
+  wanted_full_name: string;
+  case_reference: string | null;
+  hotel_name: string;
+  hotel_address: string | null;
+  hotel_maps_lat: number;
+  hotel_maps_lng: number;
+  room_number: string;
+  booking_code: string;
+  guest_full_name: string;
+  check_in_date: string;
+  check_out_date: string;
+  reviewed_at: string | null;
+  review_note: string | null;
+}
+
+/** /ws/police/alerts payload. A new match is always PENDING_REVIEW and the
+ *  alert omits status/stay dates (fetch /police/matches for the full row). */
+export interface PoliceMatchAlert {
+  type: "POLICE_MATCH_ALERT";
+  match_id: string;
+  matched_at: string;
+  wanted_full_name: string;
+  case_reference: string | null;
+  booking_code: string;
+  guest_full_name: string;
+  hotel_name: string;
+  hotel_address: string | null;
+  hotel_maps_lat: number;
+  hotel_maps_lng: number;
+  room_number: string;
+}
+
+export type PoliceWsEvent = PoliceMatchAlert | { type: string };
+
+// --- Admin police-alerts projection (app/api/admin_router.py) --------------
+// REDACTED metadata for the platform operator: no registry number, no hash.
+// The authoritative dispatch surface is the police realm's /police/matches.
+export interface AdminPoliceAlert {
+  match_id: string;
+  matched_at: string;
+  status: PoliceMatchStatus;
+  wanted_full_name: string;
+  case_reference: string | null;
+  tenant_id: string;
+  hotel_name: string;
+  room_number: string;
+  booking_code: string;
+  guest_full_name: string;
+}

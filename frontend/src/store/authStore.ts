@@ -11,6 +11,10 @@ export type UserRole =
   | "CLEANER"
   | "RESTAURANT_OWNER";
 
+/** Auth realm carried by the token. Police tokens are minted by the police
+ *  department's own identity system, never by `/auth/login`. */
+export type AuthRealm = "app" | "police";
+
 /** Landing route for each role after a successful login. */
 export const ROLE_HOME: Record<UserRole, string> = {
   PLATFORM_ADMIN: "/admin",
@@ -24,7 +28,10 @@ export const ROLE_HOME: Record<UserRole, string> = {
 interface AuthState {
   token: string | null;
   userId: string | null;
+  /** UserRole for app-realm principals, or "POLICE" for the police realm. */
   role: UserRole | null;
+  /** Which realm the token belongs to — gates the police dashboard. */
+  realm: AuthRealm | null;
   tenantId: string | null;
   restaurantId: string | null;
   /** Unix ms after which the token is dead client-side. */
@@ -50,6 +57,7 @@ const EMPTY_SESSION = {
   token: null,
   userId: null,
   role: null,
+  realm: null,
   tenantId: null,
   restaurantId: null,
   expiresAt: null,
@@ -70,6 +78,7 @@ export const useAuthStore = create<AuthState>()(
           token: accessToken,
           userId: claims.sub,
           role: claims.role as UserRole,
+          realm: claims.realm,
           tenantId: claims.tenant_id,
           restaurantId: claims.restaurant_id,
           expiresAt: claims.exp * 1000,
@@ -89,10 +98,19 @@ export const useAuthStore = create<AuthState>()(
     {
       name: "hm.auth",
       storage: createJSONStorage(() => localStorage),
-      partialize: ({ token, userId, role, tenantId, restaurantId, expiresAt }) => ({
+      partialize: ({
         token,
         userId,
         role,
+        realm,
+        tenantId,
+        restaurantId,
+        expiresAt,
+      }) => ({
+        token,
+        userId,
+        role,
+        realm,
         tenantId,
         restaurantId,
         expiresAt,
