@@ -52,6 +52,7 @@ _INSECURE_DEFAULTS: frozenset[str] = frozenset(
         "dev-registry-salt",
         "dev-khur-key",
         "dev-emongolia-secret",
+        "dev-qpay-webhook-secret",
     }
 )
 
@@ -156,6 +157,19 @@ class Settings(BaseSettings):
     IDEMPOTENCY_TTL_SECONDS: int = Field(default=86_400, ge=60)
 
     # ------------------------------------------------------------------ #
+    # QPay (B2C marketplace payment gateway)
+    # ------------------------------------------------------------------ #
+    #: When True, qpay_service wires the deterministic mock invoice client.
+    QPAY_USE_MOCKS: bool = True
+    #: Shared secret QPay signs webhook callbacks with (HMAC-SHA256). The
+    #: webhook rejects unsigned/forged calls. MUST be rotated in production.
+    QPAY_WEBHOOK_SECRET: SecretStr = SecretStr("dev-qpay-webhook-secret")
+    #: Base for the mock QR/deeplink returned in the invoice.
+    QPAY_INVOICE_BASE_URL: str = "https://qpay.mn/q"
+    #: Invoice validity window surfaced to the guest (minutes).
+    QPAY_INVOICE_TTL_MINUTES: int = Field(default=15, ge=1)
+
+    # ------------------------------------------------------------------ #
     # Janitor (background sweeps)
     # ------------------------------------------------------------------ #
     JANITOR_INTERVAL_SECONDS: int = Field(default=300, ge=30)
@@ -242,6 +256,7 @@ class Settings(BaseSettings):
             "EMONGOLIA_CLIENT_SECRET": (
                 self.EMONGOLIA_CLIENT_SECRET.get_secret_value()
             ),
+            "QPAY_WEBHOOK_SECRET": self.QPAY_WEBHOOK_SECRET.get_secret_value(),
         }
         for name, value in secrets_to_audit.items():
             if value in _INSECURE_DEFAULTS:
@@ -257,6 +272,11 @@ class Settings(BaseSettings):
             violations.append(
                 "GOV_USE_MOCKS must be False in production "
                 "(mock KHUR/e-Mongolia adapters fabricate citizen identities)"
+            )
+        if self.QPAY_USE_MOCKS:
+            violations.append(
+                "QPAY_USE_MOCKS must be False in production "
+                "(mock QPay auto-approves invoices)"
             )
         if any("*" in origin for origin in self.CORS_ALLOW_ORIGINS) or any(
             origin.startswith("http://") for origin in self.CORS_ALLOW_ORIGINS
