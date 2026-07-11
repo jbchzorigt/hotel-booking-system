@@ -565,3 +565,58 @@ export interface AdminPoliceAlert {
   booking_code: string;
   guest_full_name: string;
 }
+
+// --- B2C public marketplace (app/api/public_router.py) ---------------------
+export interface PublicHotel {
+  tenant_id: string;
+  name: string;
+  slug: string;
+  address: string | null;
+  maps_lat: number;
+  maps_lng: number;
+  distance_km: number | null;
+  available_rooms: number;
+  min_nightly_rate: string | null;
+}
+
+/** QPay invoice (qpay_service.QPayInvoice.as_dict). qr_text is the string
+ *  to encode into the QR the guest scans. */
+export interface QPayInvoice {
+  invoice_id: string;
+  amount: string;
+  currency: string;
+  qr_text: string;
+  payment_url: string;
+  expires_at: string;
+}
+
+export interface PublicBookingResponse {
+  booking_id: string;
+  booking_code: string;
+  status: BookingStatus;
+  hotel_name: string;
+  room_number: string;
+  nights: number;
+  total_amount: string;
+  currency: string;
+  qpay_invoice: QPayInvoice;
+}
+
+export interface PublicBookingStatus {
+  booking_id: string;
+  booking_code: string;
+  status: BookingStatus;
+  escrow_status: EscrowStatus;
+  is_funded: boolean;
+  paid_at: string | null;
+}
+
+/** POST /auth/emongolia — GuestTokenResponse (mock e-Mongolia SSO). */
+export interface GuestTokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  role: "GUEST";
+  guest_id: string;
+  full_name: string;
+}

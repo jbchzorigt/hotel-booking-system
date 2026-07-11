@@ -116,6 +116,19 @@ class PublicBookingResponse(BaseModel):
     qpay_invoice: dict[str, str]
 
 
+class PublicBookingStatus(BaseModel):
+    """Poll target for the checkout screen — the guest holds the opaque
+    ``booking_id`` from creation, so this needs no auth. Metadata only."""
+
+    booking_id: uuid.UUID
+    booking_code: str
+    status: BookingStatus
+    escrow_status: EscrowStatus
+    #: True once QPay has funded the booking (status CONFIRMED / escrow HELD).
+    is_funded: bool
+    paid_at: datetime | None
+
+
 # ===========================================================================
 # Schemas — webhook
 # ===========================================================================
@@ -339,6 +352,77 @@ async def create_booking(body: PublicBookingRequest) -> PublicBookingResponse:
             total_amount=total,
             currency=settings.PLATFORM_CURRENCY,
             qpay_invoice=invoice.as_dict(),
+        )
+
+
+# ===========================================================================
+# GET /public/bookings/{id} — payment-status poll (checkout screen)
+# ===========================================================================
+@router.get("/bookings/{booking_id}", response_model=PublicBookingStatus)
+async def get_booking_status(booking_id: uuid.UUID) -> PublicBookingStatus:
+    """
+    Current status of a booking, for the checkout screen to poll while the
+    guest pays. Auth is the opaque ``booking_id`` itself (a capability the
+    guest received at creation); runs in ``platform_session`` because the
+    public realm cannot read booking rows.
+    """
+    async with platform_session() as session:
+        booking = await session.get(Booking, booking_id)
+        if booking is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
+        return PublicBookingStatus(
+            booking_id=booking.id,
+            booking_code=booking.code,
+            status=booking.status,
+            escrow_status=booking.escrow_status,
+            is_funded=booking.escrow_status != EscrowStatus.NOT_FUNDED,
+            paid_at=booking.paid_at,
+        )
+
+
+# ===========================================================================
+# POST /public/bookings/{id}/simulate-payment — MOCK-ONLY funding trigger
+# ===========================================================================
+@router.post(
+    "/bookings/{booking_id}/simulate-payment",
+    response_model=PublicBookingStatus,
+)
+async def simulate_payment(booking_id: uuid.UUID) -> PublicBookingStatus:
+    """
+    Sandbox helper: fund a booking as if QPay's webhook had fired, so the
+    B2C demo completes without a real bank payment. Runs the SAME atomic,
+    idempotent conditional UPDATE the webhook uses.
+
+    Gated on ``QPAY_USE_MOCKS`` — which the config fail-fast guard forbids
+    in production — so this endpoint 404s on any real deployment.
+    """
+    if not settings.QPAY_USE_MOCKS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+
+    async with platform_session() as session:
+        await session.execute(
+            update(Booking)
+            .where(
+                Booking.id == booking_id,
+                Booking.status == BookingStatus.PENDING,
+                Booking.escrow_status == EscrowStatus.NOT_FUNDED,
+            )
+            .values(
+                status=BookingStatus.CONFIRMED,
+                escrow_status=EscrowStatus.HELD,
+                paid_at=datetime.now(timezone.utc),
+            )
+        )
+        booking = await session.get(Booking, booking_id)
+        if booking is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
+        return PublicBookingStatus(
+            booking_id=booking.id,
+            booking_code=booking.code,
+            status=booking.status,
+            escrow_status=booking.escrow_status,
+            is_funded=booking.escrow_status != EscrowStatus.NOT_FUNDED,
+            paid_at=booking.paid_at,
         )
 
 
