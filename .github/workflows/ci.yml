@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================================
+  # Backend: apply migrations to a FRESH database, then run the E2E suite.
+  # ==========================================================================
+  backend-tests:
+    name: Backend (migrations + E2E)
+    runs-on: ubuntu-latest
+
+    services:
+      # PostgreSQL 16 — matches local dev (postgres:16-alpine) and supports
+      # the GiST exclusion constraint + Row-Level Security the app relies on.
+      # Credentials/port/DB match the suite's env-driven defaults (conftest.py
+      # falls back to these; a superuser "owner" seeds/verifies past RLS).
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hotel
+          POSTGRES_PASSWORD: PyJQHYDjvBWevPD46KVV25Z5OFdS055O
+          POSTGRES_DB: hotel_marketplace_test
+        ports:
+          - 55440:5432
+        options: >-
+          --health-cmd "pg_isready -U hotel -d hotel_marketplace_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      # Redis — the E2E exercises payment idempotency and the WebSocket
+      # pub/sub relay started by the app lifespan.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Alembic connects as the schema OWNER (superuser) — never app_runtime,
+      # which RLS applies to and which cannot own/alter tables.
+      MIGRATIONS_DATABASE_URL: >-
+        postgresql+psycopg://hotel:PyJQHYDjvBWevPD46KVV25Z5OFdS055O@localhost:55440/hotel_marketplace_test
+      # Put the repo root on PYTHONPATH so `pytest -q` can import the app and
+      # the `tests` package regardless of pytest's import mode.
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Apply migrations to a fresh database (schema + RLS + roles)
+        run: alembic upgrade head
+
+      - name: Run E2E test suite
+        run: pytest -q
+
+  # ==========================================================================
+  # Frontend: install (cached), lint, type-check, and build every interface.
+  # ==========================================================================
+  frontend-build:
+    name: Frontend (lint + type-check + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache node_modules
+        id: node-modules-cache
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-node20-modules-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Cache Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: frontend/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('frontend/package-lock.json') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('frontend/package-lock.json') }}-
+
+      - name: Install dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build (B2C, Admin, Police interfaces)
+        run: npm run build
