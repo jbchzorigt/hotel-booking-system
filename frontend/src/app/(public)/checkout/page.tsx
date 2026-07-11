@@ -9,7 +9,7 @@ import {
   useState,
 } from "react";
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { isAxiosError } from "axios";
 import { QRCodeSVG } from "qrcode.react";
 import {
@@ -64,7 +64,6 @@ interface StayContext {
 
 function CheckoutInner() {
   const params = useSearchParams();
-  const router = useRouter();
 
   // -- Parse the stay context from the query string -------------------- //
   const roomId = params.get("room_id");
