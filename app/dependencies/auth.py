@@ -100,6 +100,10 @@ def _context_from_claims(claims: TokenClaims) -> AuthContext:
     if role == UserRole.PLATFORM_ADMIN.value:
         if claims.tenant_id or claims.restaurant_id:
             raise TokenError("platform admin token must not carry scope ids")
+    elif role == UserRole.GUEST.value:
+        # B2C marketplace guest: app realm, no tenant/restaurant scope.
+        if claims.tenant_id or claims.restaurant_id:
+            raise TokenError("guest token must not carry scope ids")
     elif role in _HOTEL_STAFF_ROLES:
         if not claims.tenant_id or claims.restaurant_id:
             raise TokenError("hotel-staff token must carry tenant_id only")
