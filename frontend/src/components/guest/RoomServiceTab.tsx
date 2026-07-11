@@ -15,7 +15,6 @@ import {
 import api from "@/lib/axios";
 import { formatMNT } from "@/lib/format";
 import { toast } from "@/hooks/use-toast";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,

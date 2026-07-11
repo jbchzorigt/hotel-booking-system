@@ -29,10 +29,6 @@ function isISODate(v: string | null): v is string {
   return v !== null && /^\d{4}-\d{2}-\d{2}$/.test(v);
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
 function HotelDetailInner() {
   const params = useParams<{ id: string }>();
   const searchParams = useSearchParams();
