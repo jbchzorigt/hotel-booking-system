@@ -105,6 +105,7 @@ class UserRole(str, enum.Enum):
     RECEPTION = "RECEPTION"                # front desk: check-in/out, bookings
     CLEANER = "CLEANER"                    # housekeeping: room state changes
     RESTAURANT_OWNER = "RESTAURANT_OWNER"  # manages one restaurant's menu/orders
+    GUEST = "GUEST"                        # B2C marketplace guest (e-Mongolia SSO)
 
 
 class RoomType(str, enum.Enum):
@@ -395,7 +396,10 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "OR (role = 'RESTAURANT_OWNER' AND restaurant_id IS NOT NULL "
             " AND tenant_id IS NULL) "
             "OR (role IN ('HOTEL_ADMIN', 'MANAGER', 'RECEPTION', 'CLEANER') "
-            " AND tenant_id IS NOT NULL AND restaurant_id IS NULL)",
+            " AND tenant_id IS NOT NULL AND restaurant_id IS NULL) "
+            # B2C guests belong to no tenant/restaurant (marketplace-wide).
+            "OR (role = 'GUEST' AND tenant_id IS NULL "
+            " AND restaurant_id IS NULL)",
             name="role_realm_consistency",
         ),
     )
@@ -595,6 +599,12 @@ class Booking(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
     )
     paid_at: Mapped[datetime | None]
     escrow_settled_at: Mapped[datetime | None]
+    #: QPay invoice this booking is awaiting payment on. The webhook keys
+    #: off this to fund the booking (production-shaped: QPay references the
+    #: invoice, not our booking id). Unique so one invoice funds one stay.
+    qpay_invoice_id: Mapped[str | None] = mapped_column(
+        String(80), unique=True, index=True
+    )
 
     room: Mapped[Room] = relationship(back_populates="bookings")
     food_orders: Mapped[list["FoodOrder"]] = relationship(back_populates="booking")
