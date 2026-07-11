@@ -25,6 +25,7 @@ from app.api.manager_router import router as manager_router
 from app.api.onboarding_router import admin_router as onboarding_admin_router
 from app.api.onboarding_router import public_router as onboarding_public_router
 from app.api.police_router import router as police_router
+from app.api.public_food_router import router as public_food_router
 from app.api.public_router import guest_auth_router, payments_router
 from app.api.public_router import router as public_router
 from app.api.reception_router import router as reception_router
@@ -103,6 +104,7 @@ app.include_router(onboarding_admin_router, prefix=settings.API_V1_PREFIX)
 app.include_router(tenant_admin_router, prefix=settings.API_V1_PREFIX)
 app.include_router(police_router, prefix=settings.API_V1_PREFIX)
 app.include_router(public_router, prefix=settings.API_V1_PREFIX)
+app.include_router(public_food_router, prefix=settings.API_V1_PREFIX)
 app.include_router(payments_router, prefix=settings.API_V1_PREFIX)
 app.include_router(guest_auth_router, prefix=settings.API_V1_PREFIX)
 app.include_router(ws_router)  # WS paths are not API-versioned

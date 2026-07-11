@@ -23,10 +23,12 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.core.database import platform_session
+from app.core.passwords import hash_password
 from app.dependencies.auth import AuthContext, ScopedSession, require_roles
 from app.models.domain import (
     MinibarCategory,
@@ -37,6 +39,7 @@ from app.models.domain import (
     RoomType,
     SubscriptionPlan,
     Tenant,
+    User,
     UserRole,
 )
 
@@ -392,6 +395,92 @@ async def register_restaurant(
         session, f"restaurant {body.name!r} is already registered here"
     )
     return RestaurantOut.model_validate(restaurant)
+
+
+class RestaurantProvision(BaseModel):
+    """Restaurant + its manager account, created together."""
+
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    phone: str | None = Field(default=None, max_length=32)
+    manager_email: EmailStr
+    manager_password: str = Field(min_length=10, max_length=64)
+    manager_full_name: str = Field(min_length=2, max_length=255)
+
+
+class RestaurantProvisioned(BaseModel):
+    restaurant_id: uuid.UUID
+    name: str
+    manager_user_id: uuid.UUID
+    manager_email: str
+    manager_role: UserRole
+
+
+@router.post(
+    "/restaurants/provision",
+    response_model=RestaurantProvisioned,
+    status_code=status.HTTP_201_CREATED,
+)
+async def provision_restaurant_with_manager(
+    body: RestaurantProvision, ctx: ManagerCtx
+) -> RestaurantProvisioned:
+    """
+    Create a vicinity restaurant AND its manager account in ONE atomic
+    transaction — either both exist afterwards or neither does.
+
+    Why ``platform_session`` instead of the request session: the RLS
+    ``WITH CHECK`` on ``users`` (correctly) refuses hotel sessions writing
+    restaurant-scoped accounts, and the user's FK needs the restaurant row
+    committed-visible in the same transaction. Tenant binding still comes
+    STRICTLY from the caller's token (``ctx.tenant_id``), so a hotel can
+    only ever provision into its own vicinity — same platform-orchestrated
+    pattern as guest bookings, with the scope taken from authenticated
+    context instead of request input.
+
+    The manager account gets the RESTAURANT_OWNER role: restaurant-realm
+    RLS confines it to this restaurant's menu and orders; hotel and
+    booking data stay invisible to it.
+    """
+    async with platform_session() as session:
+        restaurant = Restaurant(
+            tenant_id=ctx.tenant_id,  # token-bound, never request input
+            name=body.name,
+            description=body.description,
+            phone=body.phone,
+        )
+        session.add(restaurant)
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"restaurant {body.name!r} is already registered here",
+            ) from exc
+
+        manager = User(
+            email=body.manager_email.lower(),
+            hashed_password=hash_password(body.manager_password),
+            full_name=body.manager_full_name,
+            role=UserRole.RESTAURANT_OWNER,
+            restaurant_id=restaurant.id,
+            tenant_id=None,
+        )
+        session.add(manager)
+        try:
+            await session.flush()  # raises -> whole txn (incl. restaurant) rolls back
+        except IntegrityError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "a user with this email already exists",
+            ) from exc
+
+        return RestaurantProvisioned(
+            restaurant_id=restaurant.id,
+            name=restaurant.name,
+            manager_user_id=manager.id,
+            manager_email=manager.email,
+            manager_role=manager.role,
+        )
 
 
 @router.get("/restaurants", response_model=list[RestaurantOut])

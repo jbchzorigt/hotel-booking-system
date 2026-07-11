@@ -618,3 +618,171 @@ async def test_g_janitor_sweep(state) -> None:
             await s.commit()
     finally:
         await engine.dispose()
+
+
+# =========================================================================== #
+# Phase H — B2C in-room dining: provisioning, RLS, QPay-invoiced orders
+# =========================================================================== #
+def test_h_provision_restaurant_with_manager(client, tokens, state) -> None:
+    mgr_a = tokens["mgr_a"]
+    r = client.post("/api/v1/manager/restaurants/provision", headers=_hdr(mgr_a),
+                    json={"name": "Khan Buuz", "phone": "+976-70123456",
+                          "manager_email": "Manager@KhanBuuz.mn",
+                          "manager_password": "Khan-Buuz-2026!",
+                          "manager_full_name": "Buuz Manager"})
+    assert r.status_code == 201, r.text
+    prov = r.json()
+    assert prov["manager_role"] == "RESTAURANT_OWNER"
+    assert prov["manager_email"] == "manager@khanbuuz.mn"   # normalised
+    state["rest2_id"] = prov["restaurant_id"]
+
+    # Duplicate restaurant name -> 409
+    r = client.post("/api/v1/manager/restaurants/provision", headers=_hdr(mgr_a),
+                    json={"name": "Khan Buuz", "manager_email": "x@y.mn",
+                          "manager_password": "Whatever-123!",
+                          "manager_full_name": "Dup"})
+    assert r.status_code == 409, r.text
+
+    # ATOMICITY: new name but duplicate email -> 409 AND the restaurant
+    # must NOT have been half-created (both rows or neither).
+    r = client.post("/api/v1/manager/restaurants/provision", headers=_hdr(mgr_a),
+                    json={"name": "Ghost Diner",
+                          "manager_email": "manager@khanbuuz.mn",
+                          "manager_password": "Whatever-123!",
+                          "manager_full_name": "Dup"})
+    assert r.status_code == 409, r.text
+    names = [x["name"] for x in client.get("/api/v1/manager/restaurants",
+                                           headers=_hdr(mgr_a)).json()]
+    assert "Ghost Diner" not in names, "half-created restaurant leaked"
+
+    # The provisioned manager can REALLY log in (bcrypt roundtrip)
+    r = client.post("/api/v1/auth/login",
+                    json={"email": "manager@khanbuuz.mn",
+                          "password": "Khan-Buuz-2026!"})
+    assert r.status_code == 200, r.text
+    assert r.json()["role"] == "RESTAURANT_OWNER"
+    state["mgr2_token"] = r.json()["access_token"]
+
+
+def test_h_restaurant_manager_rls_boundaries(client, state) -> None:
+    m2 = state["mgr2_token"]
+    # Own realm: create + see ONLY own menu
+    r = client.post("/api/v1/restaurant/menu-items", headers=_hdr(m2),
+                    json={"name": "Buuz (10 pcs)", "category": "Mains",
+                          "price": "12000.00"})
+    assert r.status_code == 201, r.text
+    state["buuz_id"] = r.json()["id"]
+    mine = client.get("/api/v1/restaurant/menu-items", headers=_hdr(m2)).json()
+    assert [i["name"] for i in mine] == ["Buuz (10 pcs)"], (
+        "manager must not see Modern Nomads' menu")
+    # Cannot touch the OTHER restaurant's item
+    assert client.patch(f"/api/v1/restaurant/menu-items/{state['food_id']}",
+                        json={"price": "1.00"},
+                        headers=_hdr(m2)).status_code == 404
+    # NO access to hotel / booking / admin surfaces
+    assert client.get("/api/v1/manager/rooms", headers=_hdr(m2)).status_code == 403
+    assert client.get("/api/v1/reception/bookings",
+                      headers=_hdr(m2)).status_code == 403
+    assert client.get("/api/v1/admin/dashboard/revenue",
+                      headers=_hdr(m2)).status_code == 403
+    assert client.get("/api/v1/police/matches", headers=_hdr(m2)).status_code == 403
+
+
+def test_h_public_booking_restaurants(client, state) -> None:
+    b2_id = state["b2"]["booking_id"]
+    r = client.get(f"/api/v1/public/bookings/{b2_id}/restaurants")
+    assert r.status_code == 200, r.text
+    listing = {x["name"]: x for x in r.json()}
+    assert "Khan Buuz" in listing and "Modern Nomads" in listing
+    assert [i["name"] for i in listing["Khan Buuz"]["items"]] == ["Buuz (10 pcs)"]
+    # Unknown booking -> 404; terminated stay (guest1, CHECKED_OUT) -> 409
+    assert client.get(
+        f"/api/v1/public/bookings/{uuid.uuid4()}/restaurants").status_code == 404
+    assert client.get(
+        f"/api/v1/public/bookings/{state['booking']}/restaurants"
+    ).status_code == 409
+
+
+def test_h_public_order_and_concurrent_webhook(client, state) -> None:
+    from app.services.qpay_service import sign_webhook
+
+    b2_id = state["b2"]["booking_id"]
+    # Unavailable/foreign item -> 422, nothing written
+    r = client.post(f"/api/v1/public/bookings/{b2_id}/orders",
+                    json={"restaurant_id": state["rest2_id"],
+                          "items": [{"menu_item_id": str(uuid.uuid4()),
+                                     "quantity": 1}]})
+    assert r.status_code == 422, r.text
+
+    # Create the UNPAID order + QPay invoice
+    r = client.post(f"/api/v1/public/bookings/{b2_id}/orders",
+                    json={"restaurant_id": state["rest2_id"],
+                          "items": [{"menu_item_id": state["buuz_id"],
+                                     "quantity": 2}]})
+    assert r.status_code == 201, r.text
+    order = r.json()
+    assert order["status"] == "PLACED"
+    assert order["escrow_status"] == "NOT_FUNDED"
+    assert Decimal(str(order["total_amount"])) == Decimal("24000.00")
+    invoice_id = order["qpay_invoice"]["invoice_id"]
+    state["order2_id"] = order["order_id"]
+
+    # Restaurant feed hides UNPAID orders
+    m2 = state["mgr2_token"]
+    feed = client.get("/api/v1/restaurant/orders", headers=_hdr(m2)).json()
+    assert all(o["id"] != order["order_id"] for o in feed), (
+        "kitchen must not see unpaid orders")
+
+    # Fire the PAID webhook 5x CONCURRENTLY — exactly one funds the order.
+    body = json.dumps({"invoice_id": invoice_id,
+                       "payment_status": "PAID"}).encode()
+    hdrs = {"X-QPay-Signature": sign_webhook(body),
+            "Content-Type": "application/json"}
+    with client.websocket_connect(
+            f"/ws/restaurant/orders?token={m2}") as ws_kitchen:
+        import time
+        time.sleep(0.3)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool5:
+            results = list(pool5.map(
+                lambda _: client.post("/api/v1/payments/qpay-webhook",
+                                      content=body, headers=hdrs),
+                range(5)))
+        assert all(r.status_code == 200 for r in results)
+        outcomes = [r.json()["result"] for r in results]
+        assert outcomes.count("funded") == 1, outcomes
+        assert outcomes.count("already_funded") == 4, outcomes
+        funded = next(r.json() for r in results if r.json()["result"] == "funded")
+        assert funded["kind"] == "food_order"
+
+        # Money first, kitchen second: WS alert arrives AFTER funding
+        kitchen = json.loads(_ws_recv(ws_kitchen, 10))
+        assert kitchen["type"] == "NEW_FOOD_ORDER"
+        assert kitchen["order_id"] == order["order_id"]
+        assert Decimal(kitchen["total_amount"]) == Decimal("24000.00")
+
+    # Bad signature is still rejected
+    assert client.post("/api/v1/payments/qpay-webhook", content=body,
+                       headers={"X-QPay-Signature": "deadbeef",
+                                "Content-Type": "application/json"}
+                       ).status_code == 401
+
+
+def test_h_order_funded_visibility(client, state) -> None:
+    # Guest poll flips to funded
+    r = client.get(f"/api/v1/public/orders/{state['order2_id']}")
+    assert r.status_code == 200, r.text
+    poll = r.json()
+    assert poll["is_funded"] is True and poll["escrow_status"] == "HELD"
+    assert poll["status"] == "PLACED" and poll["paid_at"] is not None
+
+    # Kitchen now sees the paid order and can fulfil it end-to-end
+    m2 = state["mgr2_token"]
+    feed = client.get("/api/v1/restaurant/orders", headers=_hdr(m2)).json()
+    mine = [o for o in feed if o["id"] == state["order2_id"]]
+    assert len(mine) == 1 and mine[0]["escrow_status"] == "HELD"
+    for st in ("ACCEPTED", "PREPARING", "DELIVERED"):
+        r = client.patch(
+            f"/api/v1/restaurant/orders/{state['order2_id']}/status",
+            json={"status": st}, headers=_hdr(m2))
+        assert r.status_code == 200, r.text
+    assert r.json()["escrow_status"] == "RELEASED"  # 95% -> restaurant wallet
