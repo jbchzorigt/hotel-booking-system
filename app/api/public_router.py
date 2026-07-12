@@ -42,6 +42,8 @@ from pydantic import BaseModel, EmailStr, Field, model_validator
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from app.api.websocket_manager import manager as ws_manager
+from app.api.websocket_manager import restaurant_topic
 from app.core.config import settings
 from app.core.database import platform_session
 from app.core.passwords import hash_password
@@ -51,6 +53,9 @@ from app.models.domain import (
     Booking,
     BookingStatus,
     EscrowStatus,
+    FoodOrder,
+    FoodOrderItem,
+    FoodOrderStatus,
     PlatformAccount,
     Room,
     RoomState,
@@ -134,7 +139,10 @@ class PublicBookingStatus(BaseModel):
 # ===========================================================================
 class QPayWebhookResult(BaseModel):
     result: str            # "funded" | "already_funded" | "ignored"
+    #: What the invoice funded — "booking" | "food_order" (None if ignored).
+    kind: str | None = None
     booking_id: uuid.UUID | None = None
+    order_id: uuid.UUID | None = None
     status: BookingStatus | None = None
 
 
@@ -457,6 +465,9 @@ async def qpay_webhook(request: Request) -> QPayWebhookResult:
     if payment_status != "PAID":
         return QPayWebhookResult(result="ignored")
 
+    kitchen_payload: dict | None = None
+    kitchen_restaurant_id: uuid.UUID | None = None
+
     async with platform_session() as session:
         # THE idempotency guard: only a row still PENDING/NOT_FUNDED matches,
         # and the row lock serialises concurrent webhook deliveries.
@@ -480,25 +491,101 @@ async def qpay_webhook(request: Request) -> QPayWebhookResult:
         if funded_id is not None:
             return QPayWebhookResult(
                 result="funded",
+                kind="booking",
                 booking_id=funded_id,
                 status=BookingStatus.CONFIRMED,
             )
 
-        # No row transitioned: either already funded (duplicate delivery) or
-        # the invoice is unknown. Distinguish for a precise, still-200 reply.
-        existing = (
+        # Not a booking invoice — try FOOD ORDERS with the same atomic
+        # conditional-UPDATE guard (in-room dining, B2C flow). "Paid" for an
+        # order means escrow NOT_FUNDED -> HELD; fulfilment status stays
+        # PLACED (that is the restaurant's state machine, not QPay's).
+        funded_order = (
             await session.execute(
-                select(Booking.id, Booking.status).where(
-                    Booking.qpay_invoice_id == invoice_id
+                update(FoodOrder)
+                .where(
+                    FoodOrder.qpay_invoice_id == invoice_id,
+                    FoodOrder.status == FoodOrderStatus.PLACED,
+                    FoodOrder.escrow_status == EscrowStatus.NOT_FUNDED,
                 )
+                .values(
+                    escrow_status=EscrowStatus.HELD,
+                    paid_at=datetime.now(timezone.utc),
+                )
+                .returning(FoodOrder.id, FoodOrder.restaurant_id)
             )
         ).one_or_none()
 
-    if existing is None:
-        return QPayWebhookResult(result="ignored")
-    return QPayWebhookResult(
-        result="already_funded", booking_id=existing[0], status=existing[1]
-    )
+        if funded_order is not None:
+            order_id, kitchen_restaurant_id = funded_order
+            # Money first, kitchen second: gather the alert payload now so it
+            # can be published AFTER this transaction commits.
+            lines = (
+                await session.execute(
+                    select(FoodOrderItem.item_name, FoodOrderItem.quantity)
+                    .where(FoodOrderItem.food_order_id == order_id)
+                )
+            ).all()
+            order_row = (
+                await session.execute(
+                    select(FoodOrder.total_amount, Room.room_number, Booking.code)
+                    .join(Room, FoodOrder.room_id == Room.id, isouter=True)
+                    .join(Booking, FoodOrder.booking_id == Booking.id, isouter=True)
+                    .where(FoodOrder.id == order_id)
+                )
+            ).one()
+            kitchen_payload = {
+                "type": "NEW_FOOD_ORDER",
+                "order_id": str(order_id),
+                "room_number": order_row[1],
+                "booking_code": order_row[2],
+                "items": [{"name": n, "quantity": q} for n, q in lines],
+                "total_amount": str(order_row[0]),
+                "status": FoodOrderStatus.PLACED.value,
+            }
+
+        if funded_order is None:
+            # No row transitioned: already funded (duplicate delivery) or an
+            # unknown invoice. Distinguish for a precise, still-200 reply.
+            existing_booking = (
+                await session.execute(
+                    select(Booking.id, Booking.status).where(
+                        Booking.qpay_invoice_id == invoice_id
+                    )
+                )
+            ).one_or_none()
+            existing_order = (
+                await session.execute(
+                    select(FoodOrder.id).where(
+                        FoodOrder.qpay_invoice_id == invoice_id
+                    )
+                )
+            ).scalar_one_or_none()
+
+    if kitchen_payload is not None:
+        # Published only after the funding transaction committed — the
+        # kitchen must never start cooking for a payment that didn't happen.
+        await ws_manager.publish(
+            restaurant_topic(kitchen_restaurant_id), kitchen_payload
+        )
+        return QPayWebhookResult(
+            result="funded",
+            kind="food_order",
+            order_id=uuid.UUID(kitchen_payload["order_id"]),
+        )
+
+    if existing_booking is not None:
+        return QPayWebhookResult(
+            result="already_funded",
+            kind="booking",
+            booking_id=existing_booking[0],
+            status=existing_booking[1],
+        )
+    if existing_order is not None:
+        return QPayWebhookResult(
+            result="already_funded", kind="food_order", order_id=existing_order
+        )
+    return QPayWebhookResult(result="ignored")
 
 
 # ===========================================================================

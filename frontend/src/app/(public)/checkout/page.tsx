@@ -583,6 +583,9 @@ function SuccessScreen({
           </dd>
         </dl>
 
+        <Link href={`/booking/${booking.booking_id}/dining`} className="block">
+          <Button className="w-full">Order food to your room</Button>
+        </Link>
         <Link href="/" className="block">
           <Button variant="outline" className="w-full">
             Back to Stayline

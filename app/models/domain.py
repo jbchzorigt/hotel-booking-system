@@ -726,6 +726,12 @@ class FoodOrder(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     paid_at: Mapped[datetime | None]
     escrow_settled_at: Mapped[datetime | None]
+    #: QPay invoice this order is awaiting payment on (B2C in-room dining
+    #: flow). The webhook keys off this to fund the order — same
+    #: production-shaped correlation as ``Booking.qpay_invoice_id``.
+    qpay_invoice_id: Mapped[str | None] = mapped_column(
+        String(80), unique=True, index=True
+    )
 
     restaurant: Mapped[Restaurant] = relationship(back_populates="food_orders")
     booking: Mapped[Booking | None] = relationship(back_populates="food_orders")
