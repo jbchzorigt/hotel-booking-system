@@ -21,6 +21,7 @@ from app.api.auth_router import router as auth_router
 from app.api.booking_router import router as booking_router
 from app.api.cleaner_router import router as cleaner_router
 from app.api.food_order_router import router as food_order_router
+from app.api.manager_router import restaurants_router
 from app.api.manager_router import router as manager_router
 from app.api.onboarding_router import admin_router as onboarding_admin_router
 from app.api.onboarding_router import public_router as onboarding_public_router
@@ -97,6 +98,7 @@ app.include_router(food_order_router, prefix=settings.API_V1_PREFIX)
 app.include_router(reception_router, prefix=settings.API_V1_PREFIX)
 app.include_router(cleaner_router, prefix=settings.API_V1_PREFIX)
 app.include_router(manager_router, prefix=settings.API_V1_PREFIX)
+app.include_router(restaurants_router, prefix=settings.API_V1_PREFIX)
 app.include_router(restaurant_router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin_router, prefix=settings.API_V1_PREFIX)
 app.include_router(onboarding_public_router, prefix=settings.API_V1_PREFIX)

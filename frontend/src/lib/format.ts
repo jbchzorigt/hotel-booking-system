@@ -1,6 +1,7 @@
 const MNT = new Intl.NumberFormat("mn-MN", {
   style: "currency",
   currency: "MNT",
+  currencyDisplay: "narrowSymbol", // ₮ instead of "MNT"
   maximumFractionDigits: 0,
 });
 

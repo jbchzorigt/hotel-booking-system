@@ -26,8 +26,11 @@ const BASE_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
 function wsUrl(path: string, token: string): string {
-  const base = API_BASE_URL.replace(/^http/, "ws").replace(/\/$/, "");
-  return `${base}${path}?token=${encodeURIComponent(token)}`;
+  // WS endpoints are mounted at the server ROOT ("WS paths are not
+  // API-versioned"), so strip any path (e.g. /api/v1) that
+  // NEXT_PUBLIC_API_URL carries and keep only protocol + host.
+  const origin = new URL(API_BASE_URL).origin.replace(/^http/, "ws");
+  return `${origin}${path}?token=${encodeURIComponent(token)}`;
 }
 
 /**

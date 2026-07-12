@@ -658,3 +658,13 @@ export interface DiningOrderStatus {
   paid_at: string | null;
   total_amount: string;
 }
+
+// --- Restaurant manager credentials (POST /restaurants/{id}/manager) -------
+export interface RestaurantManagerCreated {
+  user_id: string;
+  email: string;
+  full_name: string;
+  role: string;
+  restaurant_id: string;
+  tenant_id: string;
+}
