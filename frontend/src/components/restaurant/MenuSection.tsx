@@ -1,13 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { isAxiosError } from "axios";
-import { Loader2, Plus } from "lucide-react";
+import { ImagePlus, Loader2, Plus, UtensilsCrossed, X } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 
-import api from "@/lib/axios";
+import api, { assetUrl, uploadImage, UploadError } from "@/lib/axios";
 import { formatMNT } from "@/lib/format";
 import { toast } from "@/hooks/use-toast";
 import { Badge } from "@/components/ui/badge";
@@ -111,6 +111,7 @@ export default function MenuSection() {
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead className="w-14" />
               <TableHead>Item</TableHead>
               <TableHead>Category</TableHead>
               <TableHead className="hidden md:table-cell">
@@ -124,7 +125,7 @@ export default function MenuSection() {
             {items.length === 0 ? (
               <TableRow>
                 <TableCell
-                  colSpan={5}
+                  colSpan={6}
                   className="py-8 text-center text-muted-foreground"
                 >
                   No menu items yet — create the first one.
@@ -136,6 +137,9 @@ export default function MenuSection() {
                   key={item.id}
                   className={item.is_available ? undefined : "opacity-50"}
                 >
+                  <TableCell>
+                    <MenuThumb src={item.image_url} alt={item.name} />
+                  </TableCell>
                   <TableCell className="font-medium">{item.name}</TableCell>
                   <TableCell>
                     {item.category ? (
@@ -177,6 +181,29 @@ export default function MenuSection() {
   );
 }
 
+/** Small square thumbnail for the menu table; falls back to an icon. */
+function MenuThumb({ src, alt }: { src: string | null; alt: string }) {
+  const resolved = assetUrl(src);
+  if (!resolved) {
+    return (
+      <div className="flex h-10 w-10 items-center justify-center rounded-md border bg-muted text-muted-foreground">
+        <UtensilsCrossed className="h-4 w-4" />
+      </div>
+    );
+  }
+  return (
+    // eslint-disable-next-line @next/next/no-img-element -- backend-served upload, not a static asset
+    <img
+      src={resolved}
+      alt={alt}
+      className="h-10 w-10 rounded-md border object-cover"
+      loading="lazy"
+    />
+  );
+}
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // matches the backend's 5 MiB cap
+
 function CreateMenuItemDialog({
   open,
   onClose,
@@ -191,17 +218,82 @@ function CreateMenuItemDialog({
     defaultValues: { name: "", description: "", category: "", price: 0 },
   });
 
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [imageError, setImageError] = useState<string | null>(null);
+
+  const clearImage = useCallback(() => {
+    setImageFile(null);
+    setImageError(null);
+    setPreviewUrl((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return null;
+    });
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, []);
+
+  // Reset everything when the dialog opens; revoke any object URL on unmount.
   useEffect(() => {
-    if (open) form.reset();
-  }, [open, form]);
+    if (open) {
+      form.reset();
+      clearImage();
+    }
+  }, [open, form, clearImage]);
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  const onPickFile = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setImageError("Please choose an image file.");
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      setImageError("Image must be 5 MB or smaller.");
+      return;
+    }
+    setImageError(null);
+    setImageFile(file);
+    setPreviewUrl((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return URL.createObjectURL(file);
+    });
+  };
 
   const onSubmit = async (values: MenuItemFormValues) => {
     try {
+      // 1) If a photo was chosen, upload it FIRST and use the returned path.
+      let imageUrl: string | null = null;
+      if (imageFile) {
+        try {
+          const { url } = await uploadImage(imageFile);
+          imageUrl = url;
+        } catch (err) {
+          const message =
+            err instanceof UploadError
+              ? err.status === 415
+                ? "That image format isn't supported (use JPG, PNG, WebP or GIF)."
+                : err.status === 413
+                  ? "Image is too large (max 5 MB)."
+                  : "Image upload failed — please try again."
+              : "Image upload failed — please try again.";
+          setImageError(message);
+          return; // abort: don't create an item pointing at a failed upload
+        }
+      }
+
+      // 2) Create the menu item with the uploaded image path attached.
       await api.post("/restaurant/menu-items", {
         name: values.name,
         description: values.description || null,
         category: values.category || null,
         price: values.price.toFixed(2),
+        image_url: imageUrl,
       });
       toast({ title: `“${values.name}” added to the menu` });
       onCreated();
@@ -290,6 +382,70 @@ function CreateMenuItemDialog({
                 </FormItem>
               )}
             />
+
+            {/* -------- Photo upload (uploaded on submit) -------- */}
+            <FormItem>
+              <FormLabel>Photo</FormLabel>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                onChange={onPickFile}
+                disabled={form.formState.isSubmitting}
+                className="hidden"
+              />
+              {previewUrl ? (
+                <div className="flex items-center gap-3">
+                  {/* eslint-disable-next-line @next/next/no-img-element -- local object URL preview */}
+                  <img
+                    src={previewUrl}
+                    alt="Selected photo preview"
+                    className="h-16 w-16 rounded-md border object-cover"
+                  />
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={form.formState.isSubmitting}
+                    >
+                      Replace
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={clearImage}
+                      disabled={form.formState.isSubmitting}
+                    >
+                      <X className="h-4 w-4" />
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={form.formState.isSubmitting}
+                  className="w-full justify-start text-muted-foreground"
+                >
+                  <ImagePlus className="h-4 w-4" />
+                  Choose an image…
+                </Button>
+              )}
+              <FormDescription>
+                Optional. JPG, PNG, WebP or GIF, up to 5 MB.
+              </FormDescription>
+              {imageError && (
+                <p className="text-[0.8rem] font-medium text-destructive">
+                  {imageError}
+                </p>
+              )}
+            </FormItem>
+
             <DialogFooter>
               <Button
                 type="button"
@@ -301,7 +457,10 @@ function CreateMenuItemDialog({
               </Button>
               <Button type="submit" disabled={form.formState.isSubmitting}>
                 {form.formState.isSubmitting ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {imageFile ? "Uploading…" : "Creating…"}
+                  </>
                 ) : (
                   "Create item"
                 )}

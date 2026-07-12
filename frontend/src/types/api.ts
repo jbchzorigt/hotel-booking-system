@@ -206,6 +206,8 @@ export interface VicinityRestaurant {
   description: string | null;
   phone: string | null;
   is_active: boolean;
+  /** True once a login has been provisioned for this restaurant. */
+  has_manager?: boolean | null;
 }
 
 // --- Platform admin (app/api/admin_router.py) -------------------------------
@@ -249,6 +251,7 @@ export interface MenuItem {
   category: string | null;
   price: string;
   is_available: boolean;
+  image_url: string | null;
 }
 
 export interface FoodOrderLine {
