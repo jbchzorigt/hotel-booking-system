@@ -56,3 +56,6 @@ Thumbs.db
 # ===========================================================================
 *.log
 *.sqlite3
+
+# User-uploaded content (menu images) — never commit
+static/uploads/

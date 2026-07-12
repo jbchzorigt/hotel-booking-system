@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.admin_router import router as admin_router
@@ -32,6 +33,8 @@ from app.api.public_router import router as public_router
 from app.api.reception_router import router as reception_router
 from app.api.restaurant_router import router as restaurant_router
 from app.api.tenant_admin_router import router as tenant_admin_router
+from app.api.upload_router import STATIC_ROOT
+from app.api.upload_router import router as upload_router
 from app.api.websocket_manager import manager, ws_router
 from app.core.config import settings
 from app.core.redis import close_redis
@@ -109,7 +112,12 @@ app.include_router(public_router, prefix=settings.API_V1_PREFIX)
 app.include_router(public_food_router, prefix=settings.API_V1_PREFIX)
 app.include_router(payments_router, prefix=settings.API_V1_PREFIX)
 app.include_router(guest_auth_router, prefix=settings.API_V1_PREFIX)
+app.include_router(upload_router, prefix=settings.API_V1_PREFIX)
 app.include_router(ws_router)  # WS paths are not API-versioned
+
+# User-uploaded content (menu images). StaticFiles serves plain files only —
+# nothing under /static is ever executed.
+app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
 
 
 @app.get("/healthz", tags=["ops"])

@@ -365,6 +365,10 @@ class RestaurantOut(BaseModel):
     description: str | None
     phone: str | None
     is_active: bool
+    #: True when at least one active RESTAURANT_OWNER account is attached.
+    #: None on create/update responses (not computed there); the list
+    #: endpoint always fills it.
+    has_manager: bool | None = None
 
     model_config = {"from_attributes": True}
 
@@ -584,12 +588,47 @@ async def create_restaurant_manager(
 async def list_restaurants(
     ctx: ManagerCtx, session: ScopedSession
 ) -> list[RestaurantOut]:
+    """Vicinity restaurants with onboarding status (``has_manager``).
+
+    The manager-existence lookup runs in a platform session because the
+    RLS on ``users`` (correctly) hides restaurant-scoped accounts from
+    hotel sessions — and it is keyed strictly to the restaurant ids the
+    caller's OWN tenant-scoped query returned, so nothing cross-tenant
+    can leak through it."""
     restaurants = (
         (await session.execute(select(Restaurant).order_by(Restaurant.name)))
         .scalars()
         .all()
     )
-    return [RestaurantOut.model_validate(r) for r in restaurants]
+    managed_ids: set[uuid.UUID] = set()
+    if restaurants:
+        async with platform_session() as psession:
+            managed_ids = set(
+                (
+                    await psession.execute(
+                        select(User.restaurant_id).where(
+                            User.restaurant_id.in_(
+                                [r.id for r in restaurants]
+                            ),
+                            User.role == UserRole.RESTAURANT_OWNER,
+                            User.is_active.is_(True),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    return [
+        RestaurantOut(
+            id=r.id,
+            name=r.name,
+            description=r.description,
+            phone=r.phone,
+            is_active=r.is_active,
+            has_manager=r.id in managed_ids,
+        )
+        for r in restaurants
+    ]
 
 
 class RestaurantUpdate(BaseModel):

@@ -667,6 +667,9 @@ class FoodItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     category: Mapped[str | None] = mapped_column(String(80))
     price: Mapped[Money]
     is_available: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: Served path (e.g. /static/uploads/abc.jpg) from POST /api/v1/upload,
+    #: or any absolute URL the manager pastes.
+    image_url: Mapped[str | None] = mapped_column(String(500))
 
     restaurant: Mapped[Restaurant] = relationship(back_populates="food_items")
 
