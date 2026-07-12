@@ -3,12 +3,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { isAxiosError } from "axios";
-import { Loader2, Plus } from "lucide-react";
+import { Dices, Eye, EyeOff, KeyRound, Loader2, Plus } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 
 import api from "@/lib/axios";
 import { toast } from "@/hooks/use-toast";
+import { useAuthStore } from "@/store/authStore";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -37,7 +38,10 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import type { VicinityRestaurant } from "@/types/api";
+import type {
+  RestaurantManagerCreated,
+  VicinityRestaurant,
+} from "@/types/api";
 
 // Mirrors RestaurantRegister in app/api/manager_router.py.
 const restaurantSchema = z.object({
@@ -53,6 +57,11 @@ export default function RestaurantsTab() {
   const [loading, setLoading] = useState(true);
   const [registerOpen, setRegisterOpen] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [managerFor, setManagerFor] = useState<VicinityRestaurant | null>(null);
+
+  // Creating restaurant login credentials is a HOTEL_ADMIN-only act
+  // (the endpoint 403s a plain MANAGER), so the action is gated to match.
+  const isHotelAdmin = useAuthStore((s) => s.role === "HOTEL_ADMIN");
 
   const refresh = useCallback(async () => {
     try {
@@ -120,6 +129,7 @@ export default function RestaurantsTab() {
               <TableHead className="hidden md:table-cell">
                 Description
               </TableHead>
+              <TableHead className="text-right">Manage</TableHead>
               <TableHead className="text-right">Active</TableHead>
             </TableRow>
           </TableHeader>
@@ -127,7 +137,7 @@ export default function RestaurantsTab() {
             {restaurants.length === 0 ? (
               <TableRow>
                 <TableCell
-                  colSpan={4}
+                  colSpan={5}
                   className="py-8 text-center text-muted-foreground"
                 >
                   No restaurants registered yet.
@@ -147,6 +157,22 @@ export default function RestaurantsTab() {
                   </TableCell>
                   <TableCell className="hidden max-w-md truncate text-muted-foreground md:table-cell">
                     {restaurant.description ?? "—"}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    {isHotelAdmin ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setManagerFor(restaurant)}
+                      >
+                        <KeyRound className="h-4 w-4" />
+                        Create Manager Login
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">
+                        Admin only
+                      </span>
+                    )}
                   </TableCell>
                   <TableCell className="text-right">
                     <Switch
@@ -172,6 +198,11 @@ export default function RestaurantsTab() {
           setRegisterOpen(false);
           void refresh();
         }}
+      />
+
+      <CreateManagerDialog
+        restaurant={managerFor}
+        onClose={() => setManagerFor(null)}
       />
     </div>
   );
@@ -296,6 +327,238 @@ function RegisterRestaurantDialog({
                   </>
                 ) : (
                   "Register"
+                )}
+              </Button>
+            </DialogFooter>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ===========================================================================
+// Create restaurant-manager login (HOTEL_ADMIN only)
+// ===========================================================================
+// Mirrors RestaurantManagerCreate in app/api/manager_router.py — note the
+// 10-char password floor (staff accounts, stricter than the login form's 8).
+const managerSchema = z.object({
+  email: z.string().email("Not a valid email"),
+  password: z
+    .string()
+    .min(10, "At least 10 characters")
+    .max(64, "At most 64 characters"),
+  full_name: z
+    .string()
+    .trim()
+    .min(2, "At least 2 characters")
+    .max(255, "At most 255 characters"),
+});
+
+type ManagerFormValues = z.infer<typeof managerSchema>;
+
+function CreateManagerDialog({
+  restaurant,
+  onClose,
+}: {
+  restaurant: VicinityRestaurant | null;
+  onClose: () => void;
+}) {
+  const [showPassword, setShowPassword] = useState(false);
+
+  const form = useForm<ManagerFormValues>({
+    resolver: zodResolver(managerSchema),
+    defaultValues: { email: "", password: "", full_name: "Restaurant Manager" },
+  });
+
+  useEffect(() => {
+    if (restaurant) {
+      form.reset({
+        email: "",
+        password: "",
+        full_name: "Restaurant Manager",
+      });
+      setShowPassword(false);
+    }
+  }, [restaurant, form]);
+
+  const generatePassword = () => {
+    const alphabet =
+      "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$%";
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    form.setValue(
+      "password",
+      Array.from(bytes, (b) => alphabet[b % alphabet.length]).join(""),
+      { shouldValidate: true }
+    );
+    setShowPassword(true);
+  };
+
+  const onSubmit = async (values: ManagerFormValues) => {
+    if (!restaurant) return;
+    try {
+      const { data } = await api.post<RestaurantManagerCreated>(
+        `/restaurants/${restaurant.id}/manager`,
+        {
+          email: values.email,
+          password: values.password,
+          full_name: values.full_name,
+        }
+      );
+      toast({
+        title: "Manager login created",
+        description: `${data.email} can now sign in to manage ${restaurant.name}.`,
+      });
+      onClose();
+    } catch (err) {
+      if (isAxiosError(err) && err.response?.status === 409) {
+        form.setError("email", {
+          message: "A user with this email already exists.",
+        });
+      } else if (isAxiosError(err) && err.response?.status === 404) {
+        toast({
+          variant: "destructive",
+          title: "Restaurant not found",
+          description: "It may have been removed — refresh and try again.",
+        });
+        onClose();
+      } else if (isAxiosError(err) && err.response?.status === 403) {
+        toast({
+          variant: "destructive",
+          title: "Not allowed",
+          description: "Only the hotel admin can create restaurant logins.",
+        });
+      } else {
+        toast({
+          variant: "destructive",
+          title: "Could not create the login",
+        });
+      }
+    }
+  };
+
+  return (
+    <Dialog open={restaurant !== null} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Create manager login</DialogTitle>
+          <DialogDescription>
+            {restaurant && (
+              <>
+                Credentials for{" "}
+                <span className="font-medium text-foreground">
+                  {restaurant.name}
+                </span>
+                . The account can manage only this restaurant&apos;s menu and
+                orders.
+              </>
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        <Form {...form}>
+          <form
+            onSubmit={form.handleSubmit(onSubmit)}
+            className="space-y-4"
+            noValidate
+          >
+            <FormField
+              control={form.control}
+              name="full_name"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Manager name</FormLabel>
+                  <FormControl>
+                    <Input placeholder="Restaurant Manager" {...field} />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="email"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Manager email</FormLabel>
+                  <FormControl>
+                    <Input
+                      type="email"
+                      autoComplete="off"
+                      placeholder="manager@restaurant.mn"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="password"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Password</FormLabel>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <FormControl>
+                        <Input
+                          type={showPassword ? "text" : "password"}
+                          autoComplete="new-password"
+                          className="pr-10 font-mono"
+                          {...field}
+                        />
+                      </FormControl>
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((v) => !v)}
+                        className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-muted-foreground hover:text-foreground"
+                        aria-label={showPassword ? "Hide password" : "Show password"}
+                        tabIndex={-1}
+                      >
+                        {showPassword ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={generatePassword}
+                      title="Generate a strong password"
+                    >
+                      <Dices className="h-4 w-4" />
+                      Generate
+                    </Button>
+                  </div>
+                  <FormDescription>
+                    10–64 characters. Share it with the manager over a secure
+                    channel.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={onClose}
+                disabled={form.formState.isSubmitting}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={form.formState.isSubmitting}>
+                {form.formState.isSubmitting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Creating…
+                  </>
+                ) : (
+                  "Create login"
                 )}
               </Button>
             </DialogFooter>
