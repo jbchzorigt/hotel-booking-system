@@ -3,7 +3,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { isAxiosError } from "axios";
-import { Dices, Eye, EyeOff, KeyRound, Loader2, Plus } from "lucide-react";
+import {
+  CheckCircle2,
+  Dices,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Loader2,
+  Plus,
+} from "lucide-react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 
@@ -159,7 +167,12 @@ export default function RestaurantsTab() {
                     {restaurant.description ?? "—"}
                   </TableCell>
                   <TableCell className="text-right">
-                    {isHotelAdmin ? (
+                    {restaurant.has_manager ? (
+                      <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
+                        <CheckCircle2 className="h-4 w-4" />
+                        Manager Active
+                      </span>
+                    ) : isHotelAdmin ? (
                       <Button
                         variant="outline"
                         size="sm"
@@ -170,7 +183,7 @@ export default function RestaurantsTab() {
                       </Button>
                     ) : (
                       <span className="text-xs text-muted-foreground">
-                        Admin only
+                        No manager yet
                       </span>
                     )}
                   </TableCell>
@@ -203,6 +216,15 @@ export default function RestaurantsTab() {
       <CreateManagerDialog
         restaurant={managerFor}
         onClose={() => setManagerFor(null)}
+        onCreated={(restaurantId) => {
+          // Flip the row to "Manager Active" without a round-trip.
+          setRestaurants((current) =>
+            current.map((r) =>
+              r.id === restaurantId ? { ...r, has_manager: true } : r
+            )
+          );
+          setManagerFor(null);
+        }}
       />
     </div>
   );
@@ -360,9 +382,11 @@ type ManagerFormValues = z.infer<typeof managerSchema>;
 function CreateManagerDialog({
   restaurant,
   onClose,
+  onCreated,
 }: {
   restaurant: VicinityRestaurant | null;
   onClose: () => void;
+  onCreated: (restaurantId: string) => void;
 }) {
   const [showPassword, setShowPassword] = useState(false);
 
@@ -409,7 +433,7 @@ function CreateManagerDialog({
         title: "Manager login created",
         description: `${data.email} can now sign in to manage ${restaurant.name}.`,
       });
-      onClose();
+      onCreated(restaurant.id);
     } catch (err) {
       if (isAxiosError(err) && err.response?.status === 409) {
         form.setError("email", {

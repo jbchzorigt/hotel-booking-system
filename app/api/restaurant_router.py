@@ -82,6 +82,8 @@ class MenuItemCreate(BaseModel):
     description: str | None = Field(default=None, max_length=2000)
     category: str | None = Field(default=None, max_length=80)
     price: Decimal = Field(ge=0, decimal_places=2)
+    #: Path returned by POST /api/v1/upload, or an absolute image URL.
+    image_url: str | None = Field(default=None, max_length=500)
 
 
 class MenuItemUpdate(BaseModel):
@@ -90,6 +92,7 @@ class MenuItemUpdate(BaseModel):
     category: str | None = Field(default=None, max_length=80)
     price: Decimal | None = Field(default=None, ge=0, decimal_places=2)
     is_available: bool | None = None
+    image_url: str | None = Field(default=None, max_length=500)
 
 
 class MenuItemOut(BaseModel):
@@ -99,6 +102,7 @@ class MenuItemOut(BaseModel):
     category: str | None
     price: Decimal
     is_available: bool
+    image_url: str | None
 
     model_config = {"from_attributes": True}
 
@@ -166,6 +170,7 @@ async def create_menu_item(
         description=body.description,
         category=body.category,
         price=body.price,
+        image_url=body.image_url,
     )
     session.add(item)
     try:

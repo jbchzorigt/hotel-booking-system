@@ -72,6 +72,7 @@ class PublicMenuItem(BaseModel):
     description: str | None
     category: str | None
     price: Decimal
+    image_url: str | None
 
     model_config = {"from_attributes": True}
 

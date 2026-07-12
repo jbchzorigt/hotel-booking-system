@@ -836,3 +836,71 @@ def test_h_attach_manager_to_existing_restaurant(client, tokens, state) -> None:
                       headers=_hdr(chef)).status_code == 403
     assert client.get("/api/v1/reception/bookings",
                       headers=_hdr(chef)).status_code == 403
+
+
+def test_h_upload_and_menu_image(client, tokens, state) -> None:
+    """POST /api/v1/upload: auth + content validation + static serving,
+    then the URL flows onto a menu item and out through the public menu."""
+    m2 = state["mgr2_token"]
+    png = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)  # valid magic, tiny body
+
+    # Anonymous -> 401; guest-less roles that manage no content -> 403
+    assert client.post("/api/v1/upload",
+                       files={"file": ("a.png", png, "image/png")}
+                       ).status_code == 401
+    assert client.post("/api/v1/upload",
+                       files={"file": ("a.png", png, "image/png")},
+                       headers=_hdr(tokens["cln_a"])).status_code == 403
+    # Wrong declared type -> 415; right type but fake content -> 415
+    assert client.post("/api/v1/upload",
+                       files={"file": ("x.pdf", b"%PDF-1.4", "application/pdf")},
+                       headers=_hdr(m2)).status_code == 415
+    assert client.post("/api/v1/upload",
+                       files={"file": ("fake.png", b"<?php evil ?>", "image/png")},
+                       headers=_hdr(m2)).status_code == 415
+
+    # Happy path: traversal-attempt filename is discarded server-side
+    r = client.post("/api/v1/upload",
+                    files={"file": ("../../evil.png", png, "image/png")},
+                    headers=_hdr(m2))
+    assert r.status_code == 201, r.text
+    up = r.json()
+    assert up["url"].startswith("/static/uploads/")
+    assert ".." not in up["url"] and up["filename"].endswith(".png")
+    assert up["size_bytes"] == len(png)
+
+    # The file is genuinely served back via StaticFiles
+    served = client.get(up["url"])
+    assert served.status_code == 200 and served.content == png
+
+    # image_url flows onto a menu item and out through BOTH menus
+    r = client.post("/api/v1/restaurant/menu-items", headers=_hdr(m2),
+                    json={"name": "Tsuivan", "category": "Mains",
+                          "price": "15000.00", "image_url": up["url"]})
+    assert r.status_code == 201, r.text
+    assert r.json()["image_url"] == up["url"]
+    b2_id = state["b2"]["booking_id"]
+    listing = {x["name"]: x for x in client.get(
+        f"/api/v1/public/bookings/{b2_id}/restaurants").json()}
+    tsuivan = next(i for i in listing["Khan Buuz"]["items"]
+                   if i["name"] == "Tsuivan")
+    assert tsuivan["image_url"] == up["url"]
+
+
+def test_h_restaurant_has_manager_flag(client, tokens, state) -> None:
+    """GET /manager/restaurants exposes onboarding status per restaurant."""
+    mgr_a = tokens["mgr_a"]
+    # A fresh restaurant with NO credentials yet
+    r = client.post("/api/v1/manager/restaurants",
+                    json={"name": "Unstaffed Cafe"}, headers=_hdr(mgr_a))
+    assert r.status_code == 201, r.text
+
+    flags = {x["name"]: x["has_manager"] for x in client.get(
+        "/api/v1/manager/restaurants", headers=_hdr(mgr_a)).json()}
+    assert flags["Khan Buuz"] is True         # provisioned with manager
+    assert flags["Modern Nomads"] is True     # chef attached in prior test
+    assert flags["Unstaffed Cafe"] is False   # nobody attached yet
+
+    # Hotel B sees none of hotel A's restaurants at all (RLS unchanged)
+    assert client.get("/api/v1/manager/restaurants",
+                      headers=_hdr(tokens["mgr_b"])).json() == []
