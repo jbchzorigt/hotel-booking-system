@@ -786,3 +786,53 @@ def test_h_order_funded_visibility(client, state) -> None:
             json={"status": st}, headers=_hdr(m2))
         assert r.status_code == 200, r.text
     assert r.json()["escrow_status"] == "RELEASED"  # 95% -> restaurant wallet
+
+
+def test_h_attach_manager_to_existing_restaurant(client, tokens, state) -> None:
+    """POST /restaurants/{id}/manager — credentials for a restaurant that
+    was registered WITHOUT a manager (Modern Nomads, from Phase D)."""
+    admin_a = _tok("HOTEL_ADMIN", tenant=state["tenant_a"])
+    admin_b = _tok("HOTEL_ADMIN", tenant=state["tenant_b"])
+    url = f"/api/v1/restaurants/{state['rest_id']}/manager"
+    payload = {"email": "Chef@ModernNomads.mn", "password": "Nomads-Chef-26!",
+               "full_name": "Nomads Chef"}
+
+    # Security matrix: only the OWNING hotel's HOTEL_ADMIN passes.
+    assert client.post(url, json=payload).status_code == 401          # anon
+    assert client.post(url, json=payload,
+                       headers=_hdr(tokens["mgr_a"])).status_code == 403  # MANAGER
+    assert client.post(url, json=payload,
+                       headers=_hdr(tokens["rec_a"])).status_code == 403  # RECEPTION
+    assert client.post(url, json=payload,
+                       headers=_hdr(admin_b)).status_code == 404  # foreign hotel
+    assert client.post(f"/api/v1/restaurants/{uuid.uuid4()}/manager",
+                       json=payload, headers=_hdr(admin_a)).status_code == 404
+
+    r = client.post(url, json=payload, headers=_hdr(admin_a))
+    assert r.status_code == 201, r.text
+    created = r.json()
+    assert created["role"] == "RESTAURANT_OWNER"
+    assert created["email"] == "chef@modernnomads.mn"          # normalised
+    assert created["restaurant_id"] == state["rest_id"]
+    assert created["tenant_id"] == str(state["tenant_a"])      # derived link
+    # Duplicate email -> 409
+    assert client.post(url, json=payload,
+                       headers=_hdr(admin_a)).status_code == 409
+
+    # The credentials WORK: login -> confined to Modern Nomads' realm.
+    r = client.post("/api/v1/auth/login",
+                    json={"email": "chef@modernnomads.mn",
+                          "password": "Nomads-Chef-26!"})
+    assert r.status_code == 200, r.text
+    chef = r.json()["access_token"]
+    menu = client.get("/api/v1/restaurant/menu-items", headers=_hdr(chef)).json()
+    assert [i["name"] for i in menu] == ["Khuushuur"], (
+        "chef must see Modern Nomads' menu and nothing else")
+    # Not Khan Buuz's item, not hotel surfaces.
+    assert client.patch(f"/api/v1/restaurant/menu-items/{state['buuz_id']}",
+                        json={"price": "1.00"},
+                        headers=_hdr(chef)).status_code == 404
+    assert client.get("/api/v1/manager/rooms",
+                      headers=_hdr(chef)).status_code == 403
+    assert client.get("/api/v1/reception/bookings",
+                      headers=_hdr(chef)).status_code == 403

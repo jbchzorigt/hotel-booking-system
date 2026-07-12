@@ -483,6 +483,103 @@ async def provision_restaurant_with_manager(
         )
 
 
+# ---------------------------------------------------------------------------
+# /restaurants/{id}/manager — attach credentials to an EXISTING restaurant.
+# Mounted on its own prefix so the path matches the public API contract
+# (POST /api/v1/restaurants/{restaurant_id}/manager); the provisioning
+# endpoint above covers the create-both-together flow.
+# ---------------------------------------------------------------------------
+restaurants_router = APIRouter(prefix="/restaurants", tags=["management"])
+
+#: Stricter than ManagerCtx on purpose: creating login credentials is an
+#: account-management act, reserved for the hotel's admin.
+HotelAdminCtx = Annotated[
+    AuthContext, Depends(require_roles(UserRole.HOTEL_ADMIN))
+]
+
+
+class RestaurantManagerCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=10, max_length=64)
+    full_name: str = Field(
+        default="Restaurant Manager", min_length=2, max_length=255
+    )
+
+
+class RestaurantManagerOut(BaseModel):
+    user_id: uuid.UUID
+    email: str
+    full_name: str
+    role: UserRole
+    restaurant_id: uuid.UUID
+    #: The hotel whose vicinity this restaurant belongs to (derived via the
+    #: restaurant row — the users table itself stores restaurant_id only).
+    tenant_id: uuid.UUID
+
+
+@restaurants_router.post(
+    "/{restaurant_id}/manager",
+    response_model=RestaurantManagerOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_restaurant_manager(
+    restaurant_id: uuid.UUID,
+    body: RestaurantManagerCreate,
+    ctx: HotelAdminCtx,
+) -> RestaurantManagerOut:
+    """
+    Create login credentials for an existing vicinity restaurant
+    (HOTEL_ADMIN only).
+
+    RLS linkage — one deliberate deviation from a naive reading: the user
+    row is bound to ``restaurant_id`` ONLY, not to ``tenant_id`` as well.
+    The ``role_realm_consistency`` CHECK constraint *requires* restaurant
+    accounts to carry no tenant_id (the tenant tie lives on the restaurant
+    row itself), and the ``restaurant_isolation`` RLS policies key on
+    ``app_restaurant_id()`` — which is exactly what confines this account
+    to this one restaurant's menu and orders. The hotel linkage is
+    enforced HERE instead: the target restaurant must belong to the
+    caller's token-bound tenant, or it is a 404 (a foreign hotel's
+    restaurant id is indistinguishable from a nonexistent one).
+
+    Platform-orchestrated write, same pattern as ``/restaurants/provision``:
+    the users RLS ``WITH CHECK`` correctly refuses hotel sessions writing
+    restaurant-scoped accounts, so the insert runs under the platform
+    identity with the ownership check done against token context.
+    """
+    async with platform_session() as session:
+        restaurant = await session.get(Restaurant, restaurant_id)
+        if restaurant is None or restaurant.tenant_id != ctx.tenant_id:
+            # Foreign or nonexistent — identical 404, no existence oracle.
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "restaurant not found")
+
+        manager = User(
+            email=body.email.lower(),
+            hashed_password=hash_password(body.password),
+            full_name=body.full_name,
+            role=UserRole.RESTAURANT_OWNER,  # the restaurant-manager role
+            restaurant_id=restaurant.id,
+            tenant_id=None,  # required NULL by role_realm_consistency
+        )
+        session.add(manager)
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "a user with this email already exists",
+            ) from exc
+
+        return RestaurantManagerOut(
+            user_id=manager.id,
+            email=manager.email,
+            full_name=manager.full_name,
+            role=manager.role,
+            restaurant_id=restaurant.id,
+            tenant_id=restaurant.tenant_id,
+        )
+
+
 @router.get("/restaurants", response_model=list[RestaurantOut])
 async def list_restaurants(
     ctx: ManagerCtx, session: ScopedSession
