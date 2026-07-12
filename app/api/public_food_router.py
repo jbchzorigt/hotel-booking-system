@@ -32,13 +32,15 @@ validation happens before any row is written.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 
+from app.api.websocket_manager import manager as ws_manager
+from app.api.websocket_manager import restaurant_topic
 from app.core.config import settings
 from app.core.database import platform_session
 from app.models.domain import (
@@ -51,6 +53,7 @@ from app.models.domain import (
     FoodOrderStatus,
     PlatformAccount,
     Restaurant,
+    Room,
 )
 from app.services import qpay_service
 
@@ -323,3 +326,89 @@ async def get_order_status(order_id: uuid.UUID) -> PublicFoodOrderStatus:
             paid_at=order.paid_at,
             total_amount=order.total_amount,
         )
+
+
+# ===========================================================================
+# POST /public/orders/{order_id}/simulate-payment — MOCK-ONLY funding
+# ===========================================================================
+@router.post(
+    "/orders/{order_id}/simulate-payment",
+    response_model=PublicFoodOrderStatus,
+)
+async def simulate_order_payment(order_id: uuid.UUID) -> PublicFoodOrderStatus:
+    """
+    Sandbox helper: fund a food order as if QPay's webhook had fired — the
+    SAME atomic conditional UPDATE and the SAME post-commit kitchen alert
+    (``NEW_FOOD_ORDER`` on the restaurant's WS topic), so the guest demo
+    and the KDS live-update path behave exactly like production.
+
+    Gated on ``QPAY_USE_MOCKS`` — which the config fail-fast guard forbids
+    in production — so this endpoint 404s on any real deployment.
+    """
+    if not settings.QPAY_USE_MOCKS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+
+    kitchen_payload: dict | None = None
+    kitchen_restaurant_id: uuid.UUID | None = None
+
+    async with platform_session() as session:
+        funded = (
+            await session.execute(
+                update(FoodOrder)
+                .where(
+                    FoodOrder.id == order_id,
+                    FoodOrder.status == FoodOrderStatus.PLACED,
+                    FoodOrder.escrow_status == EscrowStatus.NOT_FUNDED,
+                )
+                .values(
+                    escrow_status=EscrowStatus.HELD,
+                    paid_at=datetime.now(timezone.utc),
+                )
+                .returning(FoodOrder.id, FoodOrder.restaurant_id)
+            )
+        ).one_or_none()
+
+        if funded is not None:
+            _, kitchen_restaurant_id = funded
+            lines = (
+                await session.execute(
+                    select(FoodOrderItem.item_name, FoodOrderItem.quantity)
+                    .where(FoodOrderItem.food_order_id == order_id)
+                )
+            ).all()
+            order_row = (
+                await session.execute(
+                    select(FoodOrder.total_amount, Room.room_number, Booking.code)
+                    .join(Room, FoodOrder.room_id == Room.id, isouter=True)
+                    .join(Booking, FoodOrder.booking_id == Booking.id, isouter=True)
+                    .where(FoodOrder.id == order_id)
+                )
+            ).one()
+            kitchen_payload = {
+                "type": "NEW_FOOD_ORDER",
+                "order_id": str(order_id),
+                "room_number": order_row[1],
+                "booking_code": order_row[2],
+                "items": [{"name": n, "quantity": q} for n, q in lines],
+                "total_amount": str(order_row[0]),
+                "status": FoodOrderStatus.PLACED.value,
+            }
+
+        order = await session.get(FoodOrder, order_id)
+        if order is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "order not found")
+        result = PublicFoodOrderStatus(
+            order_id=order.id,
+            status=order.status,
+            escrow_status=order.escrow_status,
+            is_funded=order.escrow_status != EscrowStatus.NOT_FUNDED,
+            paid_at=order.paid_at,
+            total_amount=order.total_amount,
+        )
+
+    # Money first, kitchen second — publish only after the commit.
+    if kitchen_payload is not None:
+        await ws_manager.publish(
+            restaurant_topic(kitchen_restaurant_id), kitchen_payload
+        )
+    return result

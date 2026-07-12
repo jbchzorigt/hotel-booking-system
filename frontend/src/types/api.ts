@@ -620,3 +620,41 @@ export interface GuestTokenResponse {
   guest_id: string;
   full_name: string;
 }
+
+// --- B2C in-room dining (app/api/public_food_router.py) --------------------
+export interface DiningMenuItem {
+  id: string;
+  name: string;
+  description: string | null;
+  category: string | null;
+  price: string;
+}
+
+/** GET /public/bookings/{id}/restaurants — vicinity restaurants w/ menus. */
+export interface DiningRestaurant {
+  restaurant_id: string;
+  name: string;
+  description: string | null;
+  phone: string | null;
+  items: DiningMenuItem[];
+}
+
+export interface DiningOrderResponse {
+  order_id: string;
+  restaurant_name: string;
+  status: FoodOrderStatus;
+  escrow_status: EscrowStatus;
+  total_amount: string;
+  currency: string;
+  qpay_invoice: QPayInvoice;
+}
+
+/** GET /public/orders/{id} — payment poll for the dining checkout. */
+export interface DiningOrderStatus {
+  order_id: string;
+  status: FoodOrderStatus;
+  escrow_status: EscrowStatus;
+  is_funded: boolean;
+  paid_at: string | null;
+  total_amount: string;
+}
