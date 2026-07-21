@@ -1,6 +1,7 @@
 # Web framework
 fastapi>=0.115
 uvicorn[standard]>=0.30
+python-multipart>=0.0.9   # multipart/form-data parsing (POST /api/v1/upload)
 
 # Database
 sqlalchemy[asyncio]>=2.0.30
