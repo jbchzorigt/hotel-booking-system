@@ -43,7 +43,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.core.config import settings
 from app.core.database import tenant_session
 from app.dependencies.auth import AuthContext, ScopedSession, require_roles
 from app.models.domain import (
@@ -55,6 +54,7 @@ from app.models.domain import (
     Room,
     RoomState,
     RoomType,
+    Tenant,
     UserRole,
 )
 from app.services import gov_service
@@ -542,6 +542,10 @@ async def create_walk_in_booking(
 
     citizen = await _fetch_citizen_or_http_error(body.guest_registry_number)
 
+    # Per-tenant fee of the reception's own hotel (RLS lets it read its
+    # own tenant row).
+    hotel = await session.get(Tenant, ctx.tenant_id)
+
     booking = Booking(
         tenant_id=ctx.tenant_id,
         room_id=room.id,
@@ -554,7 +558,7 @@ async def create_walk_in_booking(
         status=BookingStatus.CONFIRMED,             # pay-at-desk on checkout
         nightly_rate=room.base_price,
         total_amount=room.base_price * nights,
-        commission_rate=Decimal(str(settings.PLATFORM_COMMISSION_RATE)),
+        commission_rate=hotel.platform_fee_percent / Decimal("100"),
         commission_amount=Decimal("0.00"),
     )
     session.add(booking)

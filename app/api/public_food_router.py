@@ -54,6 +54,7 @@ from app.models.domain import (
     PlatformAccount,
     Restaurant,
     Room,
+    Tenant,
 )
 from app.services import qpay_service
 
@@ -260,6 +261,8 @@ async def create_food_order(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "platform account not initialised",
             )
+        # Per-tenant fee of the delivery hotel (the order's tenant).
+        hotel = await session.get(Tenant, booking.tenant_id)
 
         total = sum(
             (catalogue[l.menu_item_id].price * l.quantity for l in body.items),
@@ -272,7 +275,7 @@ async def create_food_order(
             room_id=booking.room_id,
             status=FoodOrderStatus.PLACED,
             total_amount=total,
-            commission_rate=platform.commission_rate,  # snapshot
+            commission_rate=hotel.platform_fee_percent / Decimal("100"),
             commission_amount=Decimal("0.00"),
         )
         session.add(order)

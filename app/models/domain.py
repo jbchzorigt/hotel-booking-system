@@ -47,6 +47,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     SmallInteger,
     String,
     Text,
@@ -344,6 +345,10 @@ class Tenant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "wallet_balance >= 0", name="wallet_balance_non_negative"
         ),
+        CheckConstraint(
+            "platform_fee_percent >= 0 AND platform_fee_percent <= 100",
+            name="platform_fee_percent_range",
+        ),
     )
 
     name: Mapped[str]
@@ -371,6 +376,14 @@ class Tenant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: Merchant wallet — escrow releases credit the hotel's 95% share here.
     #: Updated only under ``SELECT ... FOR UPDATE`` by the escrow service.
     wallet_balance: Mapped[Balance] = mapped_column(default=Decimal("0.00"))
+
+    #: Platform commission as a PERCENT (5.00 == 5%). Snapshotted onto each
+    #: booking/food order at creation as a fraction (percent / 100), so the
+    #: escrow release honours the fee that was in force when the guest paid
+    #: — later fee changes never rewrite historical splits.
+    platform_fee_percent: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2), default=Decimal("5.00"), server_default="5.00"
+    )
 
     users: Mapped[list["User"]] = relationship(back_populates="tenant")
     rooms: Mapped[list["Room"]] = relationship(back_populates="tenant")

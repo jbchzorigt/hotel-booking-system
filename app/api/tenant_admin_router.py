@@ -77,9 +77,43 @@ class TenantCreate(BaseModel):
     maps_lat: Decimal = Field(ge=-90, le=90)
     maps_lng: Decimal = Field(ge=-180, le=180)
     subscription_plan: SubscriptionPlan = SubscriptionPlan.MONTHS_12
+    #: Platform commission as a percent (5.00 == 5%). Defaults to 5% when
+    #: omitted; snapshotted onto each booking/order at creation time.
+    platform_fee_percent: Decimal = Field(
+        default=Decimal("5.00"), ge=0, le=100, decimal_places=2
+    )
     #: Optional link back to the sales lead: marks it CONVERTED atomically
     #: with the tenant creation.
     contact_request_id: uuid.UUID | None = None
+
+
+class TenantUpdate(BaseModel):
+    """Editable tenant fields for PATCH /admin/tenants/{id}."""
+
+    contact_email: EmailStr | None = None
+    contact_phone: str | None = Field(default=None, max_length=32)
+    address: str | None = Field(default=None, max_length=500)
+    is_active: bool | None = None
+    #: New commission rate — applies to bookings/orders created AFTER the
+    #: change; already-snapshotted payables keep their frozen rate.
+    platform_fee_percent: Decimal | None = Field(
+        default=None, ge=0, le=100, decimal_places=2
+    )
+
+
+class TenantOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    slug: str
+    contact_email: str
+    contact_phone: str | None
+    address: str | None
+    subscription_plan: SubscriptionPlan
+    subscription_expires_at: datetime
+    is_active: bool
+    platform_fee_percent: Decimal
+
+    model_config = {"from_attributes": True}
 
 
 class TenantCreated(BaseModel):
@@ -88,6 +122,7 @@ class TenantCreated(BaseModel):
     slug: str
     subscription_plan: SubscriptionPlan
     subscription_expires_at: datetime
+    platform_fee_percent: Decimal
     converted_lead_id: uuid.UUID | None
 
 
@@ -162,6 +197,7 @@ async def create_tenant(
         # 365/12 to stay within a day of the true calendar length.
         subscription_expires_at=now
         + timedelta(days=round(body.subscription_plan.months * 365 / 12)),
+        platform_fee_percent=body.platform_fee_percent,
     )
     session.add(tenant)
     try:
@@ -180,8 +216,41 @@ async def create_tenant(
         slug=tenant.slug,
         subscription_plan=tenant.subscription_plan,
         subscription_expires_at=tenant.subscription_expires_at,
+        platform_fee_percent=tenant.platform_fee_percent,
         converted_lead_id=lead.id if lead is not None else None,
     )
+
+
+# ===========================================================================
+# GET / PATCH /admin/tenants/{tenant_id}
+# ===========================================================================
+@router.get("/{tenant_id}", response_model=TenantOut)
+async def get_tenant(
+    tenant_id: uuid.UUID, ctx: AdminCtx, session: ScopedSession
+) -> TenantOut:
+    tenant = await session.get(Tenant, tenant_id)
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "tenant not found")
+    return TenantOut.model_validate(tenant)
+
+
+@router.patch("/{tenant_id}", response_model=TenantOut)
+async def update_tenant(
+    tenant_id: uuid.UUID,
+    body: TenantUpdate,
+    ctx: AdminCtx,
+    session: ScopedSession,
+) -> TenantOut:
+    """Edit a tenant (most notably ``platform_fee_percent`` — repricing a
+    hotel's commission). The change is forward-looking: it re-rates
+    bookings/orders created afterwards, never rewriting already-snapshotted
+    payables."""
+    tenant = await session.get(Tenant, tenant_id, with_for_update=True)
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "tenant not found")
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(tenant, field, value)
+    return TenantOut.model_validate(tenant)
 
 
 # ===========================================================================

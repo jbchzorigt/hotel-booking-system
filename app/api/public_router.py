@@ -329,7 +329,8 @@ async def create_booking(body: PublicBookingRequest) -> PublicBookingResponse:
             status=BookingStatus.PENDING,
             nightly_rate=room.base_price,
             total_amount=total,
-            commission_rate=platform.commission_rate,  # snapshot
+            # Per-tenant fee, snapshotted as a fraction (percent / 100).
+            commission_rate=hotel.platform_fee_percent / Decimal("100"),
             commission_amount=Decimal("0.00"),
         )
         session.add(booking)

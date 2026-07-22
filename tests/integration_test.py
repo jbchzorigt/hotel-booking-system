@@ -904,3 +904,53 @@ def test_h_restaurant_has_manager_flag(client, tokens, state) -> None:
     # Hotel B sees none of hotel A's restaurants at all (RLS unchanged)
     assert client.get("/api/v1/manager/restaurants",
                       headers=_hdr(tokens["mgr_b"])).json() == []
+
+
+def test_h_per_tenant_platform_fee(client, tokens) -> None:
+    """Dynamic per-tenant fee: create at 10%, snapshot proves 10%; PATCH to
+    20% is forward-looking (old booking keeps 10%, new one gets 20%)."""
+    import asyncio
+
+    admin = tokens["admin"]
+    # Create a tenant with a non-default 10% fee
+    r = client.post("/api/v1/admin/tenants", headers=_hdr(admin), json={
+        "name": "Fee Test Hotel", "contact_email": "fee@test.mn",
+        "maps_lat": "47.9000", "maps_lng": "106.9000",
+        "platform_fee_percent": "10.00"})
+    assert r.status_code == 201, r.text
+    t3 = r.json()["tenant_id"]
+    assert Decimal(str(r.json()["platform_fee_percent"])) == Decimal("10.00")
+    # GET reflects it; range validation rejects 150%
+    assert Decimal(str(client.get(f"/api/v1/admin/tenants/{t3}",
+        headers=_hdr(admin)).json()["platform_fee_percent"])) == Decimal("10.00")
+    assert client.patch(f"/api/v1/admin/tenants/{t3}", headers=_hdr(admin),
+                        json={"platform_fee_percent": "150"}).status_code == 422
+
+    mgr3 = _tok("MANAGER", tenant=uuid.UUID(t3))
+    ci = (date.today() + timedelta(days=10)).isoformat()
+    co = (date.today() + timedelta(days=12)).isoformat()
+
+    def _book(room_number: str) -> str:
+        rm = client.post("/api/v1/manager/rooms", headers=_hdr(mgr3), json={
+            "room_number": room_number, "room_type": "SINGLE", "beds": 1,
+            "floor": 3, "base_price": "100000.00"}).json()["id"]
+        return client.post("/api/v1/marketplace/book", json={
+            "room_id": rm, "guest_full_name": "Fee Guest",
+            "guest_phone": "+976-11112222", "check_in_date": ci,
+            "check_out_date": co, "payment_method": "QPAY"},
+            headers={"Idempotency-Key": f"fee-{uuid.uuid4()}"}).json()["booking_id"]
+
+    bid_10 = _book("F-301")
+    # Reprice to 20% — must not touch the already-snapshotted booking
+    r = client.patch(f"/api/v1/admin/tenants/{t3}", headers=_hdr(admin),
+                     json={"platform_fee_percent": "20.00"})
+    assert Decimal(str(r.json()["platform_fee_percent"])) == Decimal("20.00")
+    bid_20 = _book("F-302")
+
+    async def _check() -> None:
+        async with owner_session_ctx() as s:
+            b10 = await s.get(Booking, uuid.UUID(bid_10))
+            b20 = await s.get(Booking, uuid.UUID(bid_20))
+            assert b10.commission_rate == Decimal("0.1000"), b10.commission_rate
+            assert b20.commission_rate == Decimal("0.2000"), b20.commission_rate
+    asyncio.run(_check())
