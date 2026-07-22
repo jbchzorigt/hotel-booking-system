@@ -418,12 +418,29 @@ export const HOTEL_STAFF_ROLES = ["MANAGER", "RECEPTION", "CLEANER"] as const;
 export type HotelStaffRole = (typeof HOTEL_STAFF_ROLES)[number];
 
 // --- Tenant provisioning (app/api/tenant_admin_router.py) -------------------
+/** GET /admin/tenants — the platform admin's hotels table. Decimal fields
+ *  (platform_fee_percent) arrive as strings. */
+export interface Tenant {
+  id: string;
+  name: string;
+  slug: string;
+  contact_email: string;
+  contact_phone: string | null;
+  address: string | null;
+  subscription_plan: SubscriptionPlan;
+  subscription_expires_at: string;
+  is_active: boolean;
+  /** Per-tenant platform commission, e.g. "5.00" == 5%. */
+  platform_fee_percent: string;
+}
+
 export interface TenantCreated {
   tenant_id: string;
   name: string;
   slug: string;
   subscription_plan: SubscriptionPlan;
   subscription_expires_at: string;
+  platform_fee_percent: string;
   converted_lead_id: string | null;
 }
 
