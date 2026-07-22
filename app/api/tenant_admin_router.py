@@ -222,6 +222,23 @@ async def create_tenant(
 
 
 # ===========================================================================
+# GET /admin/tenants — list all hotels (platform admin console)
+# ===========================================================================
+@router.get("", response_model=list[TenantOut])
+async def list_tenants(
+    ctx: AdminCtx, session: ScopedSession
+) -> list[TenantOut]:
+    """All hotels, newest first — the platform admin's hotels table
+    (name, subscription, active flag, and per-tenant platform fee)."""
+    tenants = (
+        (await session.execute(select(Tenant).order_by(Tenant.created_at.desc())))
+        .scalars()
+        .all()
+    )
+    return [TenantOut.model_validate(t) for t in tenants]
+
+
+# ===========================================================================
 # GET / PATCH /admin/tenants/{tenant_id}
 # ===========================================================================
 @router.get("/{tenant_id}", response_model=TenantOut)

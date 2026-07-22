@@ -16,6 +16,7 @@ import {
   Wallet,
 } from "lucide-react";
 
+import HotelsSection from "@/components/admin/HotelsSection";
 import ProvisionHotelDialog, {
   type ProvisionPrefill,
 } from "@/components/admin/ProvisionHotelDialog";
@@ -100,6 +101,8 @@ export default function AdminPage() {
   const [provisioning, setProvisioning] = useState<ProvisionPrefill | null>(
     null
   );
+  // Bumped after a hotel is provisioned so the hotels table remounts + refetches.
+  const [hotelsVersion, setHotelsVersion] = useState(0);
 
   const refresh = useCallback(async () => {
     try {
@@ -338,6 +341,9 @@ export default function AdminPage() {
             </Card>
           </div>
 
+          {/* ---------------- Hotels ---------------- */}
+          <HotelsSection key={hotelsVersion} />
+
           {/* ---------------- Partnership requests ---------------- */}
           <Card>
             <CardHeader>
@@ -426,7 +432,10 @@ export default function AdminPage() {
         open={provisioning !== null}
         prefill={provisioning}
         onClose={() => setProvisioning(null)}
-        onProvisioned={() => void refresh()}
+        onProvisioned={() => {
+          void refresh();
+          setHotelsVersion((v) => v + 1);
+        }}
       />
     </div>
   );

@@ -81,6 +81,12 @@ const hotelSchema = z.object({
     .min(-180, "≥ -180")
     .max(180, "≤ 180"),
   subscription_plan: z.enum(["3_MONTHS", "6_MONTHS", "9_MONTHS", "12_MONTHS"]),
+  // Mirrors platform_fee_percent (Decimal, 0–100, 2dp) on TenantCreate.
+  platform_fee_percent: z.coerce
+    .number({ message: "Fee must be a number" })
+    .min(0, "≥ 0%")
+    .max(100, "≤ 100%")
+    .multipleOf(0.01, "At most 2 decimal places"),
 });
 
 // Mirrors HotelAdminCreate (password 10–64 per the backend policy).
@@ -140,6 +146,7 @@ export default function ProvisionHotelDialog({
       maps_lat: DEFAULT_LAT,
       maps_lng: DEFAULT_LNG,
       subscription_plan: "12_MONTHS",
+      platform_fee_percent: 5,
     },
   });
 
@@ -163,6 +170,7 @@ export default function ProvisionHotelDialog({
         maps_lat: DEFAULT_LAT,
         maps_lng: DEFAULT_LNG,
         subscription_plan: "12_MONTHS",
+        platform_fee_percent: 5,
       });
       adminForm.reset();
     }
@@ -181,6 +189,7 @@ export default function ProvisionHotelDialog({
         maps_lat: values.maps_lat.toFixed(6),
         maps_lng: values.maps_lng.toFixed(6),
         subscription_plan: values.subscription_plan,
+        platform_fee_percent: values.platform_fee_percent.toFixed(2),
         contact_request_id: prefill?.contact_request_id ?? null,
       });
       setTenant(data);
@@ -328,7 +337,7 @@ export default function ProvisionHotelDialog({
                     </FormItem>
                   )}
                 />
-                <div className="grid grid-cols-3 gap-4">
+                <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
                   <FormField
                     control={hotelForm.control}
                     name="maps_lat"
@@ -378,6 +387,25 @@ export default function ProvisionHotelDialog({
                             ))}
                           </SelectContent>
                         </Select>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={hotelForm.control}
+                    name="platform_fee_percent"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Platform Fee (%)</FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            min={0}
+                            max={100}
+                            step="0.01"
+                            {...field}
+                          />
+                        </FormControl>
                         <FormMessage />
                       </FormItem>
                     )}
