@@ -16,6 +16,7 @@ import {
   BadgeCheck,
   CalendarClock,
   Copy,
+  KeyRound,
   Loader2,
   PartyPopper,
   ShieldCheck,
@@ -94,7 +95,8 @@ function CheckoutInner() {
 
   const [guest, setGuest] = useState<Guest | null>(null);
   const [booking, setBooking] = useState<PublicBookingResponse | null>(null);
-  const [funded, setFunded] = useState(false);
+  // Set once the QPay webhook funds the booking — carries the arrival PIN.
+  const [funded, setFunded] = useState<PublicBookingStatus | null>(null);
 
   if (!stay || stay.nights < 1) {
     return (
@@ -115,12 +117,9 @@ function CheckoutInner() {
       {/* ---------------- Left: the active step ---------------- */}
       <div className="order-2 lg:order-1">
         {funded && booking ? (
-          <SuccessScreen booking={booking} stay={stay} />
+          <SuccessScreen booking={booking} stay={stay} pin={funded.pin_code} />
         ) : booking ? (
-          <PaymentStep
-            booking={booking}
-            onFunded={() => setFunded(true)}
-          />
+          <PaymentStep booking={booking} onFunded={setFunded} />
         ) : guest ? (
           <ReviewStep
             stay={stay}
@@ -401,16 +400,19 @@ function PaymentStep({
   onFunded,
 }: {
   booking: PublicBookingResponse;
-  onFunded: () => void;
+  onFunded: (status: PublicBookingStatus) => void;
 }) {
   const [simulating, setSimulating] = useState(false);
   const doneRef = useRef(false);
 
-  const finish = useCallback(() => {
-    if (doneRef.current) return;
-    doneRef.current = true;
-    onFunded();
-  }, [onFunded]);
+  const finish = useCallback(
+    (status: PublicBookingStatus) => {
+      if (doneRef.current) return;
+      doneRef.current = true;
+      onFunded(status);
+    },
+    [onFunded]
+  );
 
   // Poll the public status endpoint every 3s until the webhook funds it.
   useEffect(() => {
@@ -420,7 +422,7 @@ function PaymentStep({
         const { data } = await api.get<PublicBookingStatus>(
           `/public/bookings/${booking.booking_id}`
         );
-        if (active && data.is_funded) finish();
+        if (active && data.is_funded) finish(data);
       } catch {
         /* transient — keep polling */
       }
@@ -440,7 +442,7 @@ function PaymentStep({
       const { data } = await api.post<PublicBookingStatus>(
         `/public/bookings/${booking.booking_id}/simulate-payment`
       );
-      if (data.is_funded) finish();
+      if (data.is_funded) finish(data);
     } catch {
       toast({ variant: "destructive", title: "Could not simulate payment" });
       setSimulating(false);
@@ -512,9 +514,12 @@ function PaymentStep({
 function SuccessScreen({
   booking,
   stay,
+  pin,
 }: {
   booking: PublicBookingResponse;
   stay: StayContext;
+  /** Zero-trust arrival PIN from the funded booking status. */
+  pin: string | null;
 }) {
   const copyCode = async () => {
     try {
@@ -541,6 +546,23 @@ function SuccessScreen({
         </CardDescription>
       </CardHeader>
       <CardContent className="relative space-y-4">
+        {pin && (
+          <div className="rounded-lg border-2 border-emerald-300 bg-background/90 p-4 text-center dark:border-emerald-800">
+            <p className="flex items-center justify-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+              <KeyRound className="h-3.5 w-3.5" />
+              Your check-in PIN
+            </p>
+            <p className="mt-2 font-mono text-4xl font-bold tracking-[0.4em] text-slate-900 dark:text-slate-100">
+              {pin}
+            </p>
+            <p className="mx-auto mt-3 flex max-w-xs items-start justify-center gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+              <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              Provide this PIN to the reception to Check-In. Do not share it
+              with anyone else.
+            </p>
+          </div>
+        )}
+
         <div className="rounded-lg border bg-background/80 p-4 text-center">
           <p className="text-xs uppercase tracking-wide text-muted-foreground">
             Your booking code — bring it to check-in

@@ -236,6 +236,12 @@ class DeskBookingOut(BaseModel):
     status: BookingStatus
     #: Room-charge snapshot — lets the checkout form preview the invoice.
     total_amount: Decimal
+    # -- zero-trust arrival state (the PIN itself is NEVER sent here) ------ #
+    #: True for funded marketplace bookings that carry an arrival PIN;
+    #: False for walk-ins/unfunded — those use the classic check-in flow.
+    has_pin: bool = False
+    pin_verified: bool = False
+    override_requested: bool = False
 
 
 class DeskCatalogueItemOut(BaseModel):
@@ -349,6 +355,9 @@ async def list_bookings(
             check_out_date=booking.check_out_date,
             status=booking.status,
             total_amount=booking.total_amount,
+            has_pin=booking.pin_code is not None,
+            pin_verified=booking.pin_verified,
+            override_requested=booking.override_requested,
         )
         for booking, room_number in rows
     ]

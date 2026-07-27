@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import io
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Annotated
 
@@ -416,6 +416,43 @@ async def list_override_requests(
                 Booking.status == BookingStatus.CONFIRMED,
             )
             .order_by(Booking.check_in_date, Booking.created_at)
+        )
+    ).all()
+    return [
+        OverrideBookingOut(
+            booking_id=b.id,
+            booking_code=b.code,
+            hotel_name=hotel_name,
+            room_number=room_number,
+            guest_full_name=b.guest_full_name,
+            check_in_date=b.check_in_date.isoformat(),
+            check_out_date=b.check_out_date.isoformat(),
+            total_amount=b.total_amount,
+            override_requested=b.override_requested,
+            pin_verified=b.pin_verified,
+        )
+        for b, room_number, hotel_name in rows
+    ]
+
+
+@router.get("/bookings/expired", response_model=list[OverrideBookingOut])
+async def list_expired_bookings(
+    ctx: AdminCtx, session: ScopedSession
+) -> list[OverrideBookingOut]:
+    """Missed arrivals: CONFIRMED, never PIN-verified, and the check-in
+    date has passed — candidates for the no-show settlement (one-night
+    penalty to the hotel, remainder refunded, dates freed for resale)."""
+    rows = (
+        await session.execute(
+            select(Booking, Room.room_number, Tenant.name)
+            .join(Room, Booking.room_id == Room.id)
+            .join(Tenant, Booking.tenant_id == Tenant.id)
+            .where(
+                Booking.status == BookingStatus.CONFIRMED,
+                Booking.pin_verified.is_(False),
+                Booking.check_in_date < date.today(),
+            )
+            .order_by(Booking.check_in_date)
         )
     ).all()
     return [

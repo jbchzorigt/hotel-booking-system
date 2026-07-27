@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BedDouble,
+  KeyRound,
   Loader2,
   LogIn,
   LogOut,
@@ -18,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { toast } from "@/hooks/use-toast";
 import CheckInDialog from "@/components/reception/CheckInDialog";
+import VerifyPinDialog from "@/components/reception/VerifyPinDialog";
 import CheckoutDialog from "@/components/reception/CheckoutDialog";
 import WalkInDialog from "@/components/reception/WalkInDialog";
 import { Badge } from "@/components/ui/badge";
@@ -76,6 +78,7 @@ export default function ReceptionPage() {
 
   const [walkInOpen, setWalkInOpen] = useState(false);
   const [checkInBooking, setCheckInBooking] = useState<DeskBooking | null>(null);
+  const [pinBooking, setPinBooking] = useState<DeskBooking | null>(null);
   const [checkoutBooking, setCheckoutBooking] = useState<DeskBooking | null>(
     null
   );
@@ -257,16 +260,33 @@ export default function ReceptionPage() {
                             <Badge variant={badge.variant}>{badge.label}</Badge>
                           </TableCell>
                           <TableCell className="text-right">
-                            {booking.status === "CONFIRMED" && (
-                              <Button
-                                size="sm"
-                                onClick={() => setCheckInBooking(booking)}
-                                title="Verifies the guest's identity against the state KHUR registry"
-                              >
-                                <LogIn className="h-4 w-4" />
-                                Check-In
-                              </Button>
-                            )}
+                            {booking.status === "CONFIRMED" &&
+                              (booking.has_pin ? (
+                                <span className="inline-flex items-center gap-2">
+                                  {booking.override_requested && (
+                                    <Badge variant="warning">
+                                      Pending Admin Approval
+                                    </Badge>
+                                  )}
+                                  <Button
+                                    size="sm"
+                                    onClick={() => setPinBooking(booking)}
+                                    title="Zero-trust arrival: the guest's PIN releases the escrow"
+                                  >
+                                    <KeyRound className="h-4 w-4" />
+                                    Check-In
+                                  </Button>
+                                </span>
+                              ) : (
+                                <Button
+                                  size="sm"
+                                  onClick={() => setCheckInBooking(booking)}
+                                  title="Walk-in / no-PIN booking — classic KHUR check-in"
+                                >
+                                  <LogIn className="h-4 w-4" />
+                                  Check-In
+                                </Button>
+                              ))}
                             {booking.status === "CHECKED_IN" && (
                               <Button
                                 size="sm"
@@ -343,6 +363,23 @@ export default function ReceptionPage() {
         rooms={rooms}
         onClose={() => setWalkInOpen(false)}
         onCreated={() => void refresh()}
+      />
+      <VerifyPinDialog
+        booking={pinBooking}
+        onClose={() => setPinBooking(null)}
+        onCheckedIn={() => {
+          setPinBooking(null);
+          void refresh();
+        }}
+        onOverrideRequested={(bookingId) => {
+          // Badge the row immediately; the server request is idempotent.
+          setBookings((current) =>
+            current.map((b) =>
+              b.id === bookingId ? { ...b, override_requested: true } : b
+            )
+          );
+          setPinBooking(null);
+        }}
       />
       <CheckInDialog
         booking={checkInBooking}
