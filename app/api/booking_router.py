@@ -63,6 +63,7 @@ from app.services.payment_escrow_service import (
     PaymentError,
     PaymentInProgressError,
     PaymentMethod,
+    generate_arrival_pin,
 )
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
@@ -138,6 +139,9 @@ class BookResponse(BaseModel):
     booking_id: uuid.UUID
     #: Human-readable reference — the guest's key for check-in and orders.
     booking_code: str
+    #: 6-digit zero-trust arrival PIN — present the moment the booking is
+    #: funded; reception verifies it at check-in to release the escrow.
+    pin_code: str | None = None
     hotel_name: str
     room_number: str
     check_in_date: date
@@ -394,15 +398,20 @@ async def book_room(
     except PaymentError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
 
-    # ---- txn 3: confirm ------------------------------------------------- #
+    # ---- txn 3: confirm + issue the arrival PIN -------------------------- #
+    arrival_pin: str | None = None
     async with platform_session() as session:
         booking = await session.get(Booking, booking_id, with_for_update=True)
         if booking.status == BookingStatus.PENDING:
             booking.status = BookingStatus.CONFIRMED
+        if booking.pin_code is None:  # zero-trust arrival credential
+            booking.pin_code = generate_arrival_pin()
+        arrival_pin = booking.pin_code
 
     return BookResponse(
         booking_id=booking_id,
         booking_code=booking_code,
+        pin_code=arrival_pin,
         hotel_name=hotel_name,
         room_number=room_number,
         check_in_date=body.check_in_date,

@@ -619,6 +619,18 @@ class Booking(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
         String(80), unique=True, index=True
     )
 
+    # -- Zero-trust arrival verification ---------------------------------- #
+    #: 6-digit arrival PIN, generated when the booking is FUNDED and shown
+    #: to the guest via the status poll (a retrievable credential by
+    #: design — the guest must be able to read it back). NULL for walk-ins
+    #: and unfunded bookings.
+    pin_code: Mapped[str | None] = mapped_column(String(6))
+    #: True once the guest proved arrival (PIN match or admin override) —
+    #: the trigger that releases escrow to the hotel.
+    pin_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: Guest lost the PIN; reception escalates to a platform-admin override.
+    override_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+
     room: Mapped[Room] = relationship(back_populates="bookings")
     food_orders: Mapped[list["FoodOrder"]] = relationship(back_populates="booking")
     minibar_consumptions: Mapped[list[MinibarConsumption]] = relationship(
