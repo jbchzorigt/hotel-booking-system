@@ -954,3 +954,171 @@ def test_h_per_tenant_platform_fee(client, tokens) -> None:
             assert b10.commission_rate == Decimal("0.1000"), b10.commission_rate
             assert b20.commission_rate == Decimal("0.2000"), b20.commission_rate
     asyncio.run(_check())
+
+
+# =========================================================================== #
+# Phase I — Zero-trust PIN verification: escrow releases on verified arrival
+# =========================================================================== #
+def _zt_book(client, room_id: str, ci: str, co: str) -> dict:
+    """Create an UNFUNDED public booking + QPay invoice."""
+    r = client.post("/api/v1/public/bookings", json={
+        "room_id": room_id, "guest_full_name": "Zero Trust Guest",
+        "guest_phone": "+976-70707070", "check_in_date": ci,
+        "check_out_date": co})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _zt_fund(client, invoice_id: str) -> dict:
+    """Fund via a signed QPay webhook (the primary production path)."""
+    from app.services.qpay_service import sign_webhook
+    body = json.dumps({"invoice_id": invoice_id,
+                       "payment_status": "PAID"}).encode()
+    r = client.post("/api/v1/payments/qpay-webhook", content=body,
+                    headers={"X-QPay-Signature": sign_webhook(body),
+                             "Content-Type": "application/json"})
+    assert r.status_code == 200 and r.json()["result"] == "funded", r.text
+    return r.json()
+
+
+def _hotel_wallet(state) -> Decimal:
+    import asyncio
+
+    async def _read() -> Decimal:
+        async with owner_session_ctx() as s:
+            return (await s.get(Tenant, state["tenant_a"])).wallet_balance
+    return asyncio.run(_read())
+
+
+def test_i_pin_issued_on_funding(client, tokens, state) -> None:
+    mgr_a = tokens["mgr_a"]
+    mk = lambda n: client.post("/api/v1/manager/rooms", headers=_hdr(mgr_a),
+        json={"room_number": n, "room_type": "SINGLE", "beds": 1,
+              "floor": 4, "base_price": "100000.00"}).json()["id"]
+    state["zt_rooms"] = [mk("Z-401"), mk("Z-402"), mk("Z-403")]
+    ci = (date.today() + timedelta(days=60)).isoformat()
+    co = (date.today() + timedelta(days=62)).isoformat()
+    state["zt_dates"] = (ci, co)
+
+    bk = _zt_book(client, state["zt_rooms"][0], ci, co)
+    # Unfunded: PENDING, no PIN revealed
+    poll = client.get(f"/api/v1/public/bookings/{bk['booking_id']}").json()
+    assert poll["is_funded"] is False and poll["pin_code"] is None
+    # request-override on an UNFUNDED booking -> 409 (no PIN exists)
+    assert client.post(
+        f"/api/v1/reception/bookings/{bk['booking_id']}/request-override",
+        headers=_hdr(tokens["rec_a"])).status_code == 409
+
+    _zt_fund(client, bk["qpay_invoice"]["invoice_id"])
+    poll = client.get(f"/api/v1/public/bookings/{bk['booking_id']}").json()
+    assert poll["is_funded"] is True
+    assert poll["pin_code"] and len(poll["pin_code"]) == 6
+    assert poll["pin_code"].isdigit()
+    state["zt_bk1"] = bk["booking_id"]
+    state["zt_pin1"] = poll["pin_code"]
+
+
+def test_i_verify_pin_releases_escrow(client, tokens, state) -> None:
+    bid, pin = state["zt_bk1"], state["zt_pin1"]
+    url = f"/api/v1/reception/bookings/{bid}/verify-pin"
+    wrong = "000000" if pin != "000000" else "111111"
+
+    # Foreign hotel's desk cannot even see the booking; wrong PIN -> 400.
+    assert client.post(url, json={"pin": pin},
+                       headers=_hdr(tokens["rec_b"])).status_code == 404
+    assert client.post(url, json={"pin": wrong},
+                       headers=_hdr(tokens["rec_a"])).status_code == 400
+    # Funds must still be in platform escrow (HELD) after a failed attempt.
+    poll = client.get(f"/api/v1/public/bookings/{bid}").json()
+    assert poll["escrow_status"] == "HELD"
+
+    wallet_before = _hotel_wallet(state)
+    r = client.post(url, json={"pin": pin}, headers=_hdr(tokens["rec_a"]))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["status"] == "CHECKED_IN" and out["pin_verified"] is True
+    assert out["escrow_status"] == "RELEASED"
+    assert Decimal(str(out["commission_amount"])) == Decimal("10000.00")  # 5%
+    assert Decimal(str(out["hotel_amount"])) == Decimal("190000.00")     # 95%
+    assert _hotel_wallet(state) - wallet_before == Decimal("190000.00")
+
+    # Second verification -> 409 (no longer CONFIRMED, no double release).
+    assert client.post(url, json={"pin": pin},
+                       headers=_hdr(tokens["rec_a"])).status_code == 409
+
+
+def test_i_checkout_after_pin_checkin_no_double_credit(
+    client, tokens, state
+) -> None:
+    """Escrow released at ARRIVAL: checkout must settle cleanly without a
+    second release (wallet unchanged by the room leg)."""
+    wallet_before = _hotel_wallet(state)
+    r = client.post(f"/api/v1/reception/bookings/{state['zt_bk1']}/check-out",
+                    headers=_hdr(tokens["rec_a"]), json={})
+    assert r.status_code == 200, r.text
+    inv = r.json()
+    assert inv["status"] == "CHECKED_OUT"
+    assert Decimal(str(inv["commission_amount"])) == Decimal("10000.00")
+    assert Decimal(str(inv["hotel_amount"])) == Decimal("190000.00")
+    assert _hotel_wallet(state) == wallet_before, "no double credit!"
+
+
+def test_i_override_flow(client, tokens, state) -> None:
+    ci, co = state["zt_dates"]
+    bk = _zt_book(client, state["zt_rooms"][1], ci, co)
+    _zt_fund(client, bk["qpay_invoice"]["invoice_id"])
+    bid = bk["booking_id"]
+
+    # Reception escalates (idempotent); admin queue lists it.
+    for _ in range(2):
+        r = client.post(
+            f"/api/v1/reception/bookings/{bid}/request-override",
+            headers=_hdr(tokens["rec_a"]))
+        assert r.status_code == 200 and r.json()["override_requested"] is True
+    # Hotel manager cannot touch the admin surface.
+    assert client.get("/api/v1/admin/bookings/overrides",
+                      headers=_hdr(tokens["mgr_a"])).status_code == 403
+    queue = client.get("/api/v1/admin/bookings/overrides",
+                       headers=_hdr(tokens["admin"])).json()
+    assert any(q["booking_id"] == bid for q in queue)
+
+    wallet_before = _hotel_wallet(state)
+    r = client.post(f"/api/v1/admin/bookings/{bid}/approve-override",
+                    headers=_hdr(tokens["admin"]))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["status"] == "CHECKED_IN" and out["pin_verified"] is True
+    assert out["escrow_status"] == "RELEASED"
+    assert _hotel_wallet(state) - wallet_before == Decimal("190000.00")
+    # Approved booking leaves the queue; a second approval -> 409.
+    queue = client.get("/api/v1/admin/bookings/overrides",
+                       headers=_hdr(tokens["admin"])).json()
+    assert not any(q["booking_id"] == bid for q in queue)
+    assert client.post(f"/api/v1/admin/bookings/{bid}/approve-override",
+                       headers=_hdr(tokens["admin"])).status_code == 409
+
+
+def test_i_no_show_penalty_and_refund(client, tokens, state) -> None:
+    ci, co = state["zt_dates"]
+    room3 = state["zt_rooms"][2]
+    bk = _zt_book(client, room3, ci, co)      # 2 nights x 100000 = 200000
+    _zt_fund(client, bk["qpay_invoice"]["invoice_id"])
+    bid = bk["booking_id"]
+
+    wallet_before = _hotel_wallet(state)
+    r = client.post(f"/api/v1/admin/bookings/{bid}/process-no-show",
+                    headers=_hdr(tokens["admin"]))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["status"] == "NO_SHOW"
+    assert out["escrow_status"] == "REFUNDED"
+    assert Decimal(str(out["penalty_amount"])) == Decimal("100000.00")   # 1 night
+    assert Decimal(str(out["commission_amount"])) == Decimal("5000.00")  # 5%
+    assert Decimal(str(out["hotel_amount"])) == Decimal("95000.00")      # 95%
+    assert Decimal(str(out["refunded_amount"])) == Decimal("100000.00")  # rest
+    assert _hotel_wallet(state) - wallet_before == Decimal("95000.00")
+    # Idempotent by state: second attempt -> 409, no double penalty.
+    assert client.post(f"/api/v1/admin/bookings/{bid}/process-no-show",
+                       headers=_hdr(tokens["admin"])).status_code == 409
+    # NO_SHOW frees the GiST dates: the same room/dates are bookable again.
+    assert _zt_book(client, room3, ci, co)["booking_id"]

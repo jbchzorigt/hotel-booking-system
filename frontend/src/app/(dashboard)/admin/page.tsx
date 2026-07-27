@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import HotelsSection from "@/components/admin/HotelsSection";
+import OverridesSection from "@/components/admin/OverridesSection";
 import ProvisionHotelDialog, {
   type ProvisionPrefill,
 } from "@/components/admin/ProvisionHotelDialog";
@@ -340,6 +341,9 @@ export default function AdminPage() {
               </CardContent>
             </Card>
           </div>
+
+          {/* ------- Action required: zero-trust arrivals ------- */}
+          <OverridesSection />
 
           {/* ---------------- Hotels ---------------- */}
           <HotelsSection key={hotelsVersion} />

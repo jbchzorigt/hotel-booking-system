@@ -45,6 +45,11 @@ export interface DeskBooking {
   status: BookingStatus;
   /** Room-charge snapshot — used for the checkout invoice preview. */
   total_amount: string;
+  /** Zero-trust arrival: funded marketplace bookings carry a PIN. The PIN
+   *  itself is never sent to reception — only these state flags. */
+  has_pin: boolean;
+  pin_verified: boolean;
+  override_requested: boolean;
 }
 
 /** Line sent in the checkout payload for desk-recorded consumptions. */
@@ -629,6 +634,8 @@ export interface PublicBookingStatus {
   escrow_status: EscrowStatus;
   is_funded: boolean;
   paid_at: string | null;
+  /** Zero-trust arrival PIN — revealed only once the booking is funded. */
+  pin_code: string | null;
 }
 
 /** POST /auth/emongolia — GuestTokenResponse (mock e-Mongolia SSO). */
@@ -687,4 +694,61 @@ export interface RestaurantManagerCreated {
   role: string;
   restaurant_id: string;
   tenant_id: string;
+}
+
+
+// --- Zero-trust PIN check-in (reception + admin, app/api/*) ----------------
+/** POST /reception/bookings/{id}/verify-pin — releases the escrow. */
+export interface VerifyPinResponse {
+  booking_id: string;
+  booking_code: string;
+  room_number: string;
+  status: BookingStatus;
+  pin_verified: boolean;
+  escrow_status: EscrowStatus;
+  commission_amount: string;
+  hotel_amount: string;
+}
+
+/** POST /reception/bookings/{id}/request-override (idempotent). */
+export interface OverrideRequestResponse {
+  booking_id: string;
+  booking_code: string;
+  override_requested: boolean;
+  pin_verified: boolean;
+}
+
+/** GET /admin/bookings/overrides and GET /admin/bookings/expired. */
+export interface OverrideBooking {
+  booking_id: string;
+  booking_code: string;
+  hotel_name: string;
+  room_number: string;
+  guest_full_name: string;
+  check_in_date: string;
+  check_out_date: string;
+  total_amount: string;
+  override_requested: boolean;
+  pin_verified: boolean;
+}
+
+/** POST /admin/bookings/{id}/approve-override. */
+export interface OverrideApproved {
+  booking_id: string;
+  status: BookingStatus;
+  pin_verified: boolean;
+  escrow_status: EscrowStatus;
+  commission_amount: string;
+  hotel_amount: string;
+}
+
+/** POST /admin/bookings/{id}/process-no-show. */
+export interface NoShowResult {
+  booking_id: string;
+  status: BookingStatus;
+  escrow_status: EscrowStatus;
+  penalty_amount: string;
+  commission_amount: string;
+  hotel_amount: string;
+  refunded_amount: string;
 }

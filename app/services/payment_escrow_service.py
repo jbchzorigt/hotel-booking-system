@@ -55,6 +55,7 @@ from app.core.database import platform_session
 from app.core.redis import get_redis
 from app.models.domain import (
     Booking,
+    BookingStatus,
     EscrowStatus,
     FoodOrder,
     LedgerDirection,
@@ -67,6 +68,13 @@ from app.models.domain import (
 )
 
 _CENT = Decimal("0.01")
+
+
+def generate_arrival_pin() -> str:
+    """Random 6-digit arrival PIN (zero-padded, CSPRNG-backed)."""
+    import secrets
+
+    return f"{secrets.randbelow(1_000_000):06d}"
 
 
 # ===========================================================================
@@ -250,6 +258,18 @@ class EscrowSettlement:
     merchant_amount: Decimal
     merchant_type: str         # "tenant" | "restaurant"
     merchant_id: str
+    settled_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class NoShowSettlement:
+    """Returned by ``settle_no_show`` — penalty split + mock refund."""
+
+    booking_id: uuid.UUID
+    penalty_amount: Decimal
+    commission_amount: Decimal
+    hotel_amount: Decimal
+    refunded_amount: Decimal
     settled_at: datetime
 
 
@@ -484,6 +504,87 @@ class EscrowService:
         except BaseException:
             await self._guard.abort(idempotency_key)
             raise
+
+    # ------------------------------------------------------------------ #
+    # No-show — 1-night penalty to the hotel, remainder refunded (mock)
+    # ------------------------------------------------------------------ #
+    async def settle_no_show(self, booking_id: uuid.UUID) -> "NoShowSettlement":
+        """
+        Settle a CONFIRMED-but-never-arrived booking:
+
+        * penalty = ONE night (capped at the booking total) is released to
+          the hotel through the standard split — platform commission at the
+          booking's SNAPSHOTTED rate, remainder to the hotel wallet, with
+          an immutable ledger entry;
+        * the remaining held amount is refunded to the guest (mock: the
+          escrow flips to REFUNDED and the amount is reported — a real PSP
+          reversal slots in here later);
+        * booking -> NO_SHOW, which also frees the GiST date range for
+          resale (NO_SHOW is excluded from the no-overlap constraint).
+
+        Idempotent by state: only a HELD booking settles; a second call
+        raises InvalidEscrowStateError.
+        """
+        async with self._session_scope() as session:
+            booking = await session.get(Booking, booking_id, with_for_update=True)
+            if booking is None:
+                raise PayableNotFoundError(f"booking {booking_id}")
+            if booking.status != BookingStatus.CONFIRMED:
+                raise InvalidEscrowStateError(
+                    f"cannot no-show: booking is {booking.status.value}"
+                )
+            if booking.escrow_status != EscrowStatus.HELD:
+                raise InvalidEscrowStateError(
+                    f"cannot no-show: escrow is {booking.escrow_status.value}"
+                )
+
+            penalty = min(booking.nightly_rate, booking.total_amount)
+            refund = booking.total_amount - penalty
+            commission, hotel_share = split_amount(
+                penalty, booking.commission_rate
+            )
+            booking.commission_amount = commission
+
+            platform = (
+                await session.execute(
+                    select(PlatformAccount).with_for_update().limit(1)
+                )
+            ).scalar_one_or_none()
+            if platform is None:
+                raise PlatformAccountMissingError(
+                    "seed the PlatformAccount row before settling payments"
+                )
+            platform.balance += commission
+            session.add(
+                PlatformLedgerEntry(
+                    account_id=platform.id,
+                    direction=LedgerDirection.CREDIT,
+                    source_type=LedgerSourceType.BOOKING_COMMISSION,
+                    amount=commission,
+                    balance_after=platform.balance,
+                    booking_id=booking_id,
+                    note=f"no-show 1-night penalty on booking {booking_id}",
+                )
+            )
+
+            hotel = await session.get(
+                Tenant, booking.tenant_id, with_for_update=True
+            )
+            hotel.wallet_balance += hotel_share
+
+            now = datetime.now(timezone.utc)
+            booking.status = BookingStatus.NO_SHOW
+            booking.escrow_status = EscrowStatus.REFUNDED
+            booking.escrow_settled_at = now
+
+            return NoShowSettlement(
+                booking_id=booking_id,
+                penalty_amount=penalty,
+                commission_amount=commission,
+                hotel_amount=hotel_share,
+                refunded_amount=refund,
+                settled_at=now,
+            )
 
     # ------------------------------------------------------------------ #
     # Release — 5% to platform, 95% to merchant

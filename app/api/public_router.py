@@ -64,6 +64,7 @@ from app.models.domain import (
     UserRole,
 )
 from app.services import gov_service, qpay_service
+from app.services.payment_escrow_service import generate_arrival_pin
 
 router = APIRouter(prefix="/public", tags=["b2c-marketplace"])
 payments_router = APIRouter(prefix="/payments", tags=["payments"])
@@ -132,6 +133,9 @@ class PublicBookingStatus(BaseModel):
     #: True once QPay has funded the booking (status CONFIRMED / escrow HELD).
     is_funded: bool
     paid_at: datetime | None
+    #: Zero-trust arrival PIN — revealed here only once funded. The opaque
+    #: booking_id is the retrieval capability the guest holds.
+    pin_code: str | None = None
 
 
 # ===========================================================================
@@ -379,14 +383,22 @@ async def get_booking_status(booking_id: uuid.UUID) -> PublicBookingStatus:
         booking = await session.get(Booking, booking_id)
         if booking is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
-        return PublicBookingStatus(
-            booking_id=booking.id,
-            booking_code=booking.code,
-            status=booking.status,
-            escrow_status=booking.escrow_status,
-            is_funded=booking.escrow_status != EscrowStatus.NOT_FUNDED,
-            paid_at=booking.paid_at,
-        )
+        return _to_public_status(booking)
+
+
+def _to_public_status(booking: Booking) -> PublicBookingStatus:
+    funded = booking.escrow_status != EscrowStatus.NOT_FUNDED
+    return PublicBookingStatus(
+        booking_id=booking.id,
+        booking_code=booking.code,
+        status=booking.status,
+        escrow_status=booking.escrow_status,
+        is_funded=funded,
+        paid_at=booking.paid_at,
+        # PIN revealed only once funded — the opaque booking_id is the
+        # guest's retrieval capability.
+        pin_code=booking.pin_code if funded else None,
+    )
 
 
 # ===========================================================================
@@ -420,19 +432,13 @@ async def simulate_payment(booking_id: uuid.UUID) -> PublicBookingStatus:
                 status=BookingStatus.CONFIRMED,
                 escrow_status=EscrowStatus.HELD,
                 paid_at=datetime.now(timezone.utc),
+                pin_code=generate_arrival_pin(),  # zero-trust credential
             )
         )
         booking = await session.get(Booking, booking_id)
         if booking is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
-        return PublicBookingStatus(
-            booking_id=booking.id,
-            booking_code=booking.code,
-            status=booking.status,
-            escrow_status=booking.escrow_status,
-            is_funded=booking.escrow_status != EscrowStatus.NOT_FUNDED,
-            paid_at=booking.paid_at,
-        )
+        return _to_public_status(booking)
 
 
 # ===========================================================================
@@ -471,7 +477,9 @@ async def qpay_webhook(request: Request) -> QPayWebhookResult:
 
     async with platform_session() as session:
         # THE idempotency guard: only a row still PENDING/NOT_FUNDED matches,
-        # and the row lock serialises concurrent webhook deliveries.
+        # and the row lock serialises concurrent webhook deliveries. The
+        # zero-trust arrival PIN is issued in the same atomic transition —
+        # only the winning delivery writes it.
         funded_id = (
             await session.execute(
                 update(Booking)
@@ -484,6 +492,7 @@ async def qpay_webhook(request: Request) -> QPayWebhookResult:
                     status=BookingStatus.CONFIRMED,
                     escrow_status=EscrowStatus.HELD,
                     paid_at=datetime.now(timezone.utc),
+                    pin_code=generate_arrival_pin(),
                 )
                 .returning(Booking.id)
             )

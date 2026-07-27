@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import secrets
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated
 
@@ -60,6 +60,7 @@ from app.models.domain import (
 from app.services import gov_service
 from app.services.payment_escrow_service import (
     EscrowService,
+    EscrowSettlement,
     InvalidEscrowStateError,
     PaymentDeclinedError,
     PaymentError,
@@ -235,6 +236,12 @@ class DeskBookingOut(BaseModel):
     status: BookingStatus
     #: Room-charge snapshot — lets the checkout form preview the invoice.
     total_amount: Decimal
+    # -- zero-trust arrival state (the PIN itself is NEVER sent here) ------ #
+    #: True for funded marketplace bookings that carry an arrival PIN;
+    #: False for walk-ins/unfunded — those use the classic check-in flow.
+    has_pin: bool = False
+    pin_verified: bool = False
+    override_requested: bool = False
 
 
 class DeskCatalogueItemOut(BaseModel):
@@ -348,6 +355,9 @@ async def list_bookings(
             check_out_date=booking.check_out_date,
             status=booking.status,
             total_amount=booking.total_amount,
+            has_pin=booking.pin_code is not None,
+            pin_verified=booking.pin_verified,
+            override_requested=booking.override_requested,
         )
         for booking, room_number in rows
     ]
@@ -690,6 +700,175 @@ async def check_in(
     )
 
 
+# ===========================================================================
+# Zero-trust arrival: PIN verification releases the escrow at CHECK-IN
+# ===========================================================================
+class VerifyPinRequest(BaseModel):
+    pin: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    #: Optional РД — when supplied, identity is KHUR-verified and police
+    #: screening fires exactly like the classic check-in path.
+    registry_number: str | None = Field(
+        default=None, min_length=8, max_length=16
+    )
+
+
+class VerifyPinResponse(BaseModel):
+    booking_id: uuid.UUID
+    booking_code: str
+    room_number: str
+    status: BookingStatus
+    pin_verified: bool
+    escrow_status: EscrowStatus
+    #: The split released to the hotel on verified arrival.
+    commission_amount: Decimal
+    hotel_amount: Decimal
+
+
+class OverrideRequestResponse(BaseModel):
+    booking_id: uuid.UUID
+    booking_code: str
+    override_requested: bool
+    pin_verified: bool
+
+
+@router.post(
+    "/bookings/{booking_id}/verify-pin", response_model=VerifyPinResponse
+)
+async def verify_pin_check_in(
+    booking_id: uuid.UUID,
+    body: VerifyPinRequest,
+    ctx: ReceptionCtx,
+    session: ScopedSession,
+    background_tasks: BackgroundTasks,
+) -> VerifyPinResponse:
+    """
+    Zero-trust check-in: the guest proves arrival with their funded-booking
+    PIN, and ONLY then is the escrow released to the hotel.
+
+    Ordering discipline (same self-deadlock rule as checkout): the booking
+    is read WITHOUT a lock, the escrow service settles in its own platform
+    transaction, and the status/room mutations ride the request session
+    afterwards. Retry-safe: if a prior attempt released the escrow but
+    crashed before the status flip, a correct PIN re-verification proceeds
+    (release step tolerates already-RELEASED).
+    """
+    row = (
+        await session.execute(
+            select(Booking, Room)
+            .join(Room, Booking.room_id == Room.id)
+            .where(Booking.id == booking_id)
+        )
+    ).one_or_none()
+    if row is None:  # foreign hotel's booking is indistinguishable (RLS)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
+    booking, room = row
+
+    if booking.status != BookingStatus.CONFIRMED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"booking is {booking.status.value}; only CONFIRMED bookings "
+            "can verify a PIN",
+        )
+    if not booking.pin_code:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "no arrival PIN on this booking (walk-in or unfunded) — use the "
+            "regular check-in flow",
+        )
+    if room.state != RoomState.VACANT_CLEAN:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"room {room.room_number} is {room.state.value}; "
+            "housekeeping must clear it first",
+        )
+    import hmac as _hmac
+
+    if not _hmac.compare_digest(booking.pin_code, body.pin):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid PIN")
+
+    # Optional state-verified identity (before any money moves).
+    verified_name: str | None = None
+    if body.registry_number is not None:
+        citizen = await _fetch_citizen_or_http_error(body.registry_number)
+        verified_name = citizen.full_name
+
+    # PIN proven -> release the escrow (own platform txn; tolerant so a
+    # crashed prior attempt can be retried with the same PIN).
+    try:
+        settlement = await _escrow.release_booking_escrow(booking.id)
+        commission, hotel_amount = (
+            settlement.commission_amount,
+            settlement.merchant_amount,
+        )
+    except InvalidEscrowStateError:
+        if booking.escrow_status != EscrowStatus.RELEASED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"escrow is {booking.escrow_status.value}; cannot release",
+            )
+        commission = booking.commission_amount
+        hotel_amount = booking.total_amount - commission
+
+    # Mutations ride the request transaction (commits at teardown).
+    if verified_name is not None:
+        booking.guest_full_name = verified_name
+        booking.guest_registry_hash = compute_registry_hash(
+            body.registry_number
+        )
+    booking.pin_verified = True
+    booking.status = BookingStatus.CHECKED_IN
+    room.state = RoomState.OCCUPIED
+    if booking.guest_registry_hash:
+        background_tasks.add_task(
+            _screening.schedule_check_in_screening, booking.id
+        )
+
+    return VerifyPinResponse(
+        booking_id=booking.id,
+        booking_code=booking.code,
+        room_number=room.room_number,
+        status=BookingStatus.CHECKED_IN,
+        pin_verified=True,
+        escrow_status=EscrowStatus.RELEASED,
+        commission_amount=commission,
+        hotel_amount=hotel_amount,
+    )
+
+
+@router.post(
+    "/bookings/{booking_id}/request-override",
+    response_model=OverrideRequestResponse,
+)
+async def request_pin_override(
+    booking_id: uuid.UUID,
+    ctx: ReceptionCtx,
+    session: ScopedSession,
+) -> OverrideRequestResponse:
+    """Guest lost their PIN: escalate to a platform-admin manual override.
+    Idempotent — repeating the request is a no-op 200."""
+    booking = await session.get(Booking, booking_id, with_for_update=True)
+    if booking is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
+    if booking.status != BookingStatus.CONFIRMED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"booking is {booking.status.value}; overrides apply to "
+            "CONFIRMED bookings only",
+        )
+    if not booking.pin_code:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "this booking has no arrival PIN — use the regular check-in flow",
+        )
+    booking.override_requested = True
+    return OverrideRequestResponse(
+        booking_id=booking.id,
+        booking_code=booking.code,
+        override_requested=True,
+        pin_verified=booking.pin_verified,
+    )
+
+
 async def _record_desk_minibar_items(
     booking: Booking,
     desk_items: list[DeskMinibarLine],
@@ -812,7 +991,24 @@ async def _perform_checkout(
                 idempotency_key=f"walkin-room:{booking.id}",
             )
         # (4) Room escrow: 5% -> platform ledger, 95% -> hotel wallet.
-        settlement = await _escrow.release_booking_escrow(booking.id)
+        # Zero-trust PIN check-ins release at ARRIVAL, so escrow may
+        # already be RELEASED here — synthesise the settlement from the
+        # booking's persisted split instead of double-releasing.
+        if booking.escrow_status == EscrowStatus.RELEASED:
+            settlement = EscrowSettlement(
+                payable_type="booking",
+                payable_id=str(booking.id),
+                total_amount=booking.total_amount,
+                commission_amount=booking.commission_amount,
+                merchant_amount=booking.total_amount
+                - booking.commission_amount,
+                merchant_type="tenant",
+                merchant_id=str(booking.tenant_id),
+                settled_at=booking.escrow_settled_at
+                or datetime.now(timezone.utc),
+            )
+        else:
+            settlement = await _escrow.release_booking_escrow(booking.id)
     except PaymentDeclinedError:
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED, "desk payment was declined"

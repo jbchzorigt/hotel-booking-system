@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import io
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -31,13 +31,21 @@ from app.dependencies.auth import AuthContext, ScopedSession, require_roles
 from app.models.domain import (
     Booking,
     BookingStatus,
+    EscrowStatus,
     LedgerDirection,
     MinibarConsumption,
     PlatformAccount,
     PlatformLedgerEntry,
     Room,
+    RoomState,
     Tenant,
     UserRole,
+)
+from app.services.payment_escrow_service import (
+    EscrowService,
+    InvalidEscrowStateError,
+    PayableNotFoundError,
+    PaymentError,
 )
 
 router = APIRouter(prefix="/admin", tags=["platform-admin"])
@@ -350,3 +358,224 @@ async def list_police_alerts(
     """
     rows = (await session.execute(_POLICE_ALERTS_SQL, {"limit": limit})).all()
     return [PoliceAlertOut(**row._mapping) for row in rows]
+
+
+# ===========================================================================
+# Zero-trust arrivals: override queue, manual approval, no-show settlement
+# ===========================================================================
+_escrow = EscrowService()
+
+
+class OverrideBookingOut(BaseModel):
+    booking_id: uuid.UUID
+    booking_code: str
+    hotel_name: str
+    room_number: str
+    guest_full_name: str
+    check_in_date: str
+    check_out_date: str
+    total_amount: Decimal
+    override_requested: bool
+    pin_verified: bool
+
+
+class OverrideApprovedOut(BaseModel):
+    booking_id: uuid.UUID
+    status: BookingStatus
+    pin_verified: bool
+    escrow_status: EscrowStatus
+    commission_amount: Decimal
+    hotel_amount: Decimal
+
+
+class NoShowOut(BaseModel):
+    booking_id: uuid.UUID
+    status: BookingStatus
+    escrow_status: EscrowStatus
+    penalty_amount: Decimal
+    commission_amount: Decimal
+    hotel_amount: Decimal
+    #: Mock refund of the unused nights back to the guest.
+    refunded_amount: Decimal
+
+
+@router.get("/bookings/overrides", response_model=list[OverrideBookingOut])
+async def list_override_requests(
+    ctx: AdminCtx, session: ScopedSession
+) -> list[OverrideBookingOut]:
+    """Manual check-in queue: guests who lost their PIN and are waiting for
+    a platform-admin override (requested, not yet verified)."""
+    rows = (
+        await session.execute(
+            select(Booking, Room.room_number, Tenant.name)
+            .join(Room, Booking.room_id == Room.id)
+            .join(Tenant, Booking.tenant_id == Tenant.id)
+            .where(
+                Booking.override_requested.is_(True),
+                Booking.pin_verified.is_(False),
+                Booking.status == BookingStatus.CONFIRMED,
+            )
+            .order_by(Booking.check_in_date, Booking.created_at)
+        )
+    ).all()
+    return [
+        OverrideBookingOut(
+            booking_id=b.id,
+            booking_code=b.code,
+            hotel_name=hotel_name,
+            room_number=room_number,
+            guest_full_name=b.guest_full_name,
+            check_in_date=b.check_in_date.isoformat(),
+            check_out_date=b.check_out_date.isoformat(),
+            total_amount=b.total_amount,
+            override_requested=b.override_requested,
+            pin_verified=b.pin_verified,
+        )
+        for b, room_number, hotel_name in rows
+    ]
+
+
+@router.get("/bookings/expired", response_model=list[OverrideBookingOut])
+async def list_expired_bookings(
+    ctx: AdminCtx, session: ScopedSession
+) -> list[OverrideBookingOut]:
+    """Missed arrivals: CONFIRMED, never PIN-verified, and the check-in
+    date has passed — candidates for the no-show settlement (one-night
+    penalty to the hotel, remainder refunded, dates freed for resale)."""
+    rows = (
+        await session.execute(
+            select(Booking, Room.room_number, Tenant.name)
+            .join(Room, Booking.room_id == Room.id)
+            .join(Tenant, Booking.tenant_id == Tenant.id)
+            .where(
+                Booking.status == BookingStatus.CONFIRMED,
+                Booking.pin_verified.is_(False),
+                Booking.check_in_date < date.today(),
+            )
+            .order_by(Booking.check_in_date)
+        )
+    ).all()
+    return [
+        OverrideBookingOut(
+            booking_id=b.id,
+            booking_code=b.code,
+            hotel_name=hotel_name,
+            room_number=room_number,
+            guest_full_name=b.guest_full_name,
+            check_in_date=b.check_in_date.isoformat(),
+            check_out_date=b.check_out_date.isoformat(),
+            total_amount=b.total_amount,
+            override_requested=b.override_requested,
+            pin_verified=b.pin_verified,
+        )
+        for b, room_number, hotel_name in rows
+    ]
+
+
+@router.post(
+    "/bookings/{booking_id}/approve-override", response_model=OverrideApprovedOut
+)
+async def approve_override(
+    booking_id: uuid.UUID, ctx: AdminCtx, session: ScopedSession
+) -> OverrideApprovedOut:
+    """
+    Approve a manual check-in for a guest who lost their PIN: marks the
+    booking verified + CHECKED_IN, occupies the room, and releases the
+    escrow — the admin's judgement substitutes for the PIN.
+
+    Same no-self-deadlock ordering as reception: plain read -> escrow
+    release in its own platform txn (tolerant of already-RELEASED for
+    retries) -> mutations on the request session.
+    """
+    row = (
+        await session.execute(
+            select(Booking, Room)
+            .join(Room, Booking.room_id == Room.id)
+            .where(Booking.id == booking_id)
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
+    booking, room = row
+
+    if not booking.override_requested:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "no override was requested for this booking"
+        )
+    if booking.status != BookingStatus.CONFIRMED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"booking is {booking.status.value}; only CONFIRMED bookings "
+            "can be override-approved",
+        )
+    if room.state != RoomState.VACANT_CLEAN:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"room {room.room_number} is {room.state.value}; "
+            "housekeeping must clear it first",
+        )
+
+    try:
+        settlement = await _escrow.release_booking_escrow(booking.id)
+        commission, hotel_amount = (
+            settlement.commission_amount,
+            settlement.merchant_amount,
+        )
+    except InvalidEscrowStateError:
+        if booking.escrow_status != EscrowStatus.RELEASED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"escrow is {booking.escrow_status.value}; cannot release",
+            )
+        commission = booking.commission_amount
+        hotel_amount = booking.total_amount - commission
+    except PaymentError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
+
+    booking.pin_verified = True
+    booking.status = BookingStatus.CHECKED_IN
+    room.state = RoomState.OCCUPIED
+
+    return OverrideApprovedOut(
+        booking_id=booking.id,
+        status=BookingStatus.CHECKED_IN,
+        pin_verified=True,
+        escrow_status=EscrowStatus.RELEASED,
+        commission_amount=commission,
+        hotel_amount=hotel_amount,
+    )
+
+
+@router.post(
+    "/bookings/{booking_id}/process-no-show", response_model=NoShowOut
+)
+async def process_no_show(
+    booking_id: uuid.UUID, ctx: AdminCtx, session: ScopedSession
+) -> NoShowOut:
+    """
+    Settle a guest who never arrived: a ONE-night penalty is released to
+    the hotel (standard commission split at the booking's snapshotted
+    rate), the remainder is refunded to the guest (mock), the booking goes
+    NO_SHOW — which also frees the GiST date range for resale.
+
+    The whole settlement runs inside the escrow service's own locked
+    platform transaction; this endpoint only translates errors.
+    """
+    try:
+        result = await _escrow.settle_no_show(booking_id)
+    except PayableNotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "booking not found")
+    except InvalidEscrowStateError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except PaymentError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
+
+    return NoShowOut(
+        booking_id=result.booking_id,
+        status=BookingStatus.NO_SHOW,
+        escrow_status=EscrowStatus.REFUNDED,
+        penalty_amount=result.penalty_amount,
+        commission_amount=result.commission_amount,
+        hotel_amount=result.hotel_amount,
+        refunded_amount=result.refunded_amount,
+    )
