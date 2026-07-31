@@ -42,6 +42,8 @@ Final Project/
 ├── create_police_officer.py    # bootstrap a police officer (default P-1000)
 ├── docker-compose.yml          # Postgres 16 (:55440) + Redis 7 (:6379)
 ├── external_integration.md     # guide to swap mock adapters for real APIs
+├── BACKEND_README.md           # setup + architecture + integrations overview
+├── ARCHITECTURE_FLOW_REFERENCE.md  # Mermaid flows, function/DB-state map, state machines
 └── frontend/                   # Next.js app — see §3
 ```
 
@@ -62,15 +64,23 @@ Final Project/
    projection to platform admins.
 3. **PII minimization.** Raw registry numbers (РД) are **never stored** — only a
    salted HMAC hash (`compute_registry_hash`). Matching is a hash-equality join.
-4. **Escrow payment model.** The platform is merchant of record. Funds are
-   **HELD** on payment and **RELEASED** (95% merchant / 5% platform commission)
-   on fulfilment. Money movements are append-only ledger entries.
-5. **Idempotency by construction.** QPay webhooks and payment captures use a
+4. **Escrow payment model + zero-trust release.** The platform is merchant of
+   record. Funds are **HELD** on payment and **RELEASED** (merchant share /
+   platform commission) only on **verified guest arrival** — a 6-digit PIN
+   check at reception, an admin manual override, or a no-show penalty — not
+   merely on payment. Money movements are append-only ledger entries.
+5. **Dynamic per-tenant fee, snapshotted.** Each `Tenant` has an editable
+   `platform_fee_percent` (default 5%). The rate is **frozen onto each payable
+   at creation** as `commission_rate = platform_fee_percent / 100`; the release
+   reads that snapshot, so re-pricing a hotel is forward-looking and never
+   rewrites historical splits.
+6. **Idempotency by construction.** QPay webhooks and payment captures use a
    single atomic conditional `UPDATE ... WHERE status=PENDING RETURNING id`, so
    duplicate/concurrent deliveries fund exactly once.
-6. **No double-booking at the DB.** A GiST exclusion constraint rejects
+7. **No double-booking at the DB.** A GiST exclusion constraint rejects
    overlapping live bookings on a room; the API maps the violation to `409`.
-7. **Fail-fast config.** In production, known dev-default secrets, enabled mocks,
+   `NO_SHOW`/`CANCELLED` bookings are excluded, so their dates free up for resale.
+8. **Fail-fast config.** In production, known dev-default secrets, enabled mocks,
    or debug flags abort startup.
 
 ---
@@ -125,12 +135,12 @@ WebSocket paths are **not** versioned (mounted at root).
 | `public_router` | `/public`, `/payments`, `/auth` | marketplace / platform | **B2C**: hotel search, QPay booking, `qpay-webhook`, e-Mongolia SSO, status poll, sandbox pay |
 | `public_food_router` | `/public` | platform (booking-id capability) | **in-room dining**: vicinity menus, food order + QPay, status poll |
 | `food_order_router` | `/marketplace` | marketplace | public menu browsing + legacy food order |
-| `reception_router` | `/reception` | RECEPTION/MANAGER/HOTEL_ADMIN | check-in (KHUR), walk-in, checkout + invoice, desk minibar |
+| `reception_router` | `/reception` | RECEPTION/MANAGER/HOTEL_ADMIN | check-in (KHUR), walk-in, **verify-pin** (releases escrow), **request-override**, checkout + invoice, desk minibar |
 | `cleaner_router` | `/cleaner` | CLEANER/… | dirty & occupied rooms, mark-clean, minibar report |
 | `manager_router` | `/manager`, `/restaurants` | MANAGER/HOTEL_ADMIN | rooms, minibar catalogue, vicinity restaurants, **restaurant-manager provisioning** |
 | `restaurant_router` | `/restaurant` | RESTAURANT_OWNER | menu CRUD, order feed (KDS), fulfilment state machine |
-| `admin_router` | `/admin` | PLATFORM_ADMIN | revenue dashboard, top rooms, xlsx export, **redacted police alerts** |
-| `tenant_admin_router` | `/admin/tenants` | PLATFORM_ADMIN | provision hotel + first HOTEL_ADMIN |
+| `admin_router` | `/admin` | PLATFORM_ADMIN | revenue dashboard, top rooms, xlsx export, **redacted police alerts**, **override queue / approve-override / process-no-show** |
+| `tenant_admin_router` | `/admin/tenants` | PLATFORM_ADMIN | provision hotel + first HOTEL_ADMIN, **edit `platform_fee_percent`** (GET/PATCH) |
 | `onboarding_router` | `/onboarding`, `/admin/onboarding` | public + PLATFORM_ADMIN | sales lead capture + review/status |
 | `police_router` | `/police` | **police realm** | officer login, KHUR watchlist, match feed, resolve/arrest, audit log |
 | `upload_router` | `/upload` | content roles | validated image upload → `/static/uploads/…` |
@@ -144,7 +154,7 @@ WebSocket paths are **not** versioned (mounted at root).
 |---|---|
 | `gov_service.py` | KHUR citizen lookup + e-Mongolia OAuth — **Mock/Http adapters** behind `Port` protocols (deterministic mocks for dev/CI) |
 | `qpay_service.py` | invoice creation (QR text/link) + HMAC webhook signing/verification — Mock/Http adapters |
-| `payment_escrow_service.py` | capture → HELD, release → 95/5 split, ledger writes; row-locked, idempotency-keyed |
+| `payment_escrow_service.py` | capture → HELD; `release_booking_escrow` → merchant/platform split at the **snapshotted** rate + ledger writes; `settle_no_show` → 1-night penalty split + mock refund; `generate_arrival_pin`; row-locked, idempotency-keyed |
 | `police_service.py` | post-commit check-in screening (police realm), Redis alert publish |
 | `janitor_service.py` | background sweep: cancel stale unpaid PENDING bookings/orders, free GiST dates |
 
@@ -152,22 +162,32 @@ WebSocket paths are **not** versioned (mounted at root).
 
 ## 6. Data model & payment lifecycle
 
-**Key tables** (`app/models/domain.py`): `Tenant`, `User`, `Room`,
-`MinibarCategory/Item/Consumption`, `Booking`, `Restaurant`, `FoodItem`,
-`FoodOrder`, `FoodOrderItem`, `PlatformAccount`, `PlatformLedgerEntry`,
-`ContactRequest`, `WantedPerson`, `PoliceMatch`, `PoliceOfficer`,
-`PoliceAuditLog`.
+**Key tables** (`app/models/domain.py`): `Tenant` (incl. `platform_fee_percent`),
+`User`, `Room`, `MinibarCategory/Item/Consumption`, `Booking` (incl.
+`pin_code` / `pin_verified` / `override_requested`, `qpay_invoice_id`),
+`Restaurant`, `FoodItem` (incl. `image_url`), `FoodOrder`, `FoodOrderItem`,
+`PlatformAccount`, `PlatformLedgerEntry`, `ContactRequest`, `WantedPerson`,
+`PoliceMatch`, `PoliceOfficer`, `PoliceAuditLog`.
 
 **Roles** (`UserRole`): `PLATFORM_ADMIN`, `HOTEL_ADMIN`, `MANAGER`, `RECEPTION`,
 `CLEANER`, `RESTAURANT_OWNER`, `GUEST`. (`POLICE` is a separate realm principal,
 not a `UserRole`.)
 
-**Booking lifecycle:**
+**Booking lifecycle (zero-trust escrow release on arrival):**
 ```
 search → POST /public/bookings (PENDING, escrow NOT_FUNDED, + QPay invoice)
        → guest pays → POST /payments/qpay-webhook (idempotent) → CONFIRMED / HELD
-       → reception check-in (KHUR verify → police screening) → CHECKED_IN
-       → checkout: settle minibar + release room escrow (95/5) → CHECKED_OUT / VACANT_DIRTY
+                                                              + 6-digit pin_code issued
+       → guest polls booking status → pin_code revealed (once funded)
+       → reception verify-pin (PIN match; optional KHUR verify → police screening)
+              → CHECKED_IN / room OCCUPIED  +  release room escrow (split) NOW
+       → checkout: settle minibar; room escrow already RELEASED (no double credit)
+              → CHECKED_OUT / VACANT_DIRTY
+
+   edge cases:  lost PIN → reception request-override → admin approve-override → release
+                never arrived → admin process-no-show → 1-night penalty + mock refund
+                                → NO_SHOW / escrow REFUNDED / dates freed
+   walk-ins:    reception creates CONFIRMED (no PIN, pay-at-desk); escrow released at checkout
 ```
 
 **In-room dining lifecycle:**
@@ -195,6 +215,11 @@ Ordered; each feature ships schema + a re-run of the idempotent RLS script.
 6. `b7e1c9d2f4a3` — B2C GUEST role + `bookings.qpay_invoice_id`
 7. `f6755ca9f68a` — food-order QPay invoice correlation
 8. `b200544361f8` — `food_items.image_url`
+9. `f361559f8a0b` — `tenants.platform_fee_percent` (dynamic per-tenant fee)
+10. `4b4454c4abd6` — zero-trust PIN columns (`pin_code` / `pin_verified` /
+    `override_requested`)
+
+`alembic heads` → `4b4454c4abd6`.
 
 ---
 
