@@ -36,7 +36,14 @@ from app.core.database import (
     police_session,
     tenant_session,
 )
-from app.core.security import TokenClaims, TokenError, decode_access_token
+from app.core.security import (
+    APP_REALM,
+    POLICE_REALM,
+    TokenClaims,
+    TokenError,
+    decode_app_access_token,
+    decode_police_access_token,
+)
 from app.models.domain import UserRole
 
 _bearer = HTTPBearer(auto_error=False)
@@ -130,18 +137,54 @@ def _context_from_claims(claims: TokenClaims) -> AuthContext:
 # ---------------------------------------------------------------------------
 # HTTP dependencies
 # ---------------------------------------------------------------------------
-async def get_auth_context(
+def _bearer_or_401(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str:
+    if credentials is None:
+        raise _unauthorized("missing bearer token")
+    return credentials.credentials
+
+
+async def require_app_principal(
     credentials: Annotated[
         HTTPAuthorizationCredentials | None, Depends(_bearer)
     ],
 ) -> AuthContext:
-    """Authenticate the request or fail with 401."""
-    if credentials is None:
-        raise _unauthorized("missing bearer token")
+    """
+    Authenticate an APP-realm request or fail with 401.
+
+    Validation starts from the realm this dependency represents: the token is
+    checked against the app key, issuer and audience. A police token is never
+    tried against the police key here — it simply fails.
+    """
+    token = _bearer_or_401(credentials)
     try:
-        return _context_from_claims(decode_access_token(credentials.credentials))
+        return _context_from_claims(decode_app_access_token(token))
     except TokenError as exc:
         raise _unauthorized(str(exc)) from exc
+
+
+async def require_police_principal(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(_bearer)
+    ],
+) -> AuthContext:
+    """
+    Authenticate a POLICE-realm request or fail with 401.
+
+    Checked against the police key, issuer and audience ONLY — an app token,
+    including a PLATFORM_ADMIN one, cannot pass.
+    """
+    token = _bearer_or_401(credentials)
+    try:
+        return _context_from_claims(decode_police_access_token(token))
+    except TokenError as exc:
+        raise _unauthorized(str(exc)) from exc
+
+
+#: App-realm authentication. Kept under the historical name so every existing
+#: router keeps working; it is now strictly app-realm (police tokens 401).
+get_auth_context = require_app_principal
 
 
 def require_roles(*roles: UserRole) -> Callable[..., AuthContext]:
@@ -165,10 +208,16 @@ def require_roles(*roles: UserRole) -> Callable[..., AuthContext]:
 
 
 def require_police(
-    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    ctx: Annotated[AuthContext, Depends(require_police_principal)],
 ) -> AuthContext:
-    """Gate for police-realm endpoints."""
-    if ctx.realm != "police":
+    """
+    Gate for police-realm endpoints.
+
+    The realm is already established by the signing key, issuer and audience
+    verified in ``require_police_principal``; this residual check guards
+    against a minting bug rather than against an attacker.
+    """
+    if ctx.realm != POLICE_REALM:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="police realm credentials required",
@@ -177,21 +226,20 @@ def require_police(
 
 
 async def get_scoped_session(
-    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    ctx: Annotated[AuthContext, Depends(require_app_principal)],
 ) -> AsyncIterator[AsyncSession]:
     """
     Yield ONE transaction pinned (via RLS GUCs) to the caller's identity.
     Commits when the endpoint returns; rolls back if it raises.
 
+    APP realm only. Police endpoints take ``PoliceScopedSession``, which is
+    authenticated by a different key and runs on a different engine — the two
+    paths never meet.
+
     Endpoints that need a post-commit side effect (police screening,
     WebSocket broadcasts) schedule it with ``BackgroundTasks`` — FastAPI
     runs dependency teardown (our COMMIT) before background tasks fire.
     """
-    if ctx.realm == "police":
-        async with police_session() as session:
-            yield session
-        return
-
     if ctx.role == UserRole.PLATFORM_ADMIN.value:
         async with platform_session() as session:
             yield session
@@ -205,8 +253,21 @@ async def get_scoped_session(
         yield session
 
 
-#: Convenience annotation used across all routers.
+#: Convenience annotation used across all APP-realm routers.
 ScopedSession = Annotated[AsyncSession, Depends(get_scoped_session)]
+
+
+async def get_police_scoped_session(
+    ctx: Annotated[AuthContext, Depends(require_police)],
+) -> AsyncIterator[AsyncSession]:
+    """One transaction on the police engine, for an authenticated police
+    principal. Separate key, separate DB role, separate engine."""
+    async with police_session() as session:
+        yield session
+
+
+#: Police-realm session annotation.
+PoliceScopedSession = Annotated[AsyncSession, Depends(get_police_scoped_session)]
 
 
 async def get_marketplace_session() -> AsyncIterator[AsyncSession]:
@@ -227,16 +288,30 @@ MarketplaceSession = Annotated[AsyncSession, Depends(get_marketplace_session)]
 # ---------------------------------------------------------------------------
 # WebSocket authentication
 # ---------------------------------------------------------------------------
-def authenticate_ws_token(token: str | None) -> AuthContext | None:
+def authenticate_app_ws_token(token: str | None) -> AuthContext | None:
     """
-    Validate a token passed as a WebSocket query parameter
+    Validate an APP-realm token passed as a WebSocket query parameter
     (``wss://…/ws/reception?token=…``). Returns None instead of raising —
     the WS handshake path closes the socket with a policy-violation code
     rather than mapping exceptions to HTTP statuses.
+
+    WebSockets get exactly the same realm separation as HTTP: this never
+    tries the police key.
     """
     if not token:
         return None
     try:
-        return _context_from_claims(decode_access_token(token))
+        return _context_from_claims(decode_app_access_token(token))
+    except TokenError:
+        return None
+
+
+def authenticate_police_ws_token(token: str | None) -> AuthContext | None:
+    """Validate a POLICE-realm token for ``wss://…/ws/police/alerts``.
+    Never tries the app key."""
+    if not token:
+        return None
+    try:
+        return _context_from_claims(decode_police_access_token(token))
     except TokenError:
         return None

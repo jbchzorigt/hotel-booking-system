@@ -45,6 +45,7 @@ _INSECURE_DEFAULTS: frozenset[str] = frozenset(
         "supersecret",
         "dev-secret-key",
         "dev-jwt-secret",
+        "dev-police-jwt-secret",
         "postgres",
         "password",
         "admin",
@@ -94,6 +95,21 @@ class Settings(BaseSettings):
     SECRET_KEY: SecretStr = SecretStr("dev-secret-key")
     JWT_SECRET_KEY: SecretStr = SecretStr("dev-jwt-secret")
     JWT_ALGORITHM: str = "HS256"
+
+    #: Police-realm signing key. MUST differ from JWT_SECRET_KEY: the two
+    #: realms are separate security domains, so compromising the hotel
+    #: platform's key must not mint police-dispatcher credentials (and vice
+    #: versa). Enforced by the fail-fast guard below.
+    POLICE_JWT_SECRET_KEY: SecretStr = SecretStr("dev-police-jwt-secret")
+
+    #: Realm-scoped issuer/audience pairs. Validation pins BOTH, so a token
+    #: minted for one realm fails three independent checks in the other
+    #: (signature, issuer, audience).
+    JWT_APP_ISSUER: str = "hotel-marketplace"
+    JWT_APP_AUDIENCE: str = "hotel-marketplace:app"
+    JWT_POLICE_ISSUER: str = "hotel-marketplace:police"
+    JWT_POLICE_AUDIENCE: str = "hotel-marketplace:police-realm"
+
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30, ge=5, le=24 * 60)
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=14, ge=1, le=90)
 
@@ -110,6 +126,16 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = "app_user"
     POSTGRES_PASSWORD: SecretStr = SecretStr("postgres")
     POSTGRES_DB: str = "hotel_marketplace"
+
+    #: Platform-realm login role. Cross-tenant workflows (escrow settlement,
+    #: reconciliation, admin dashboards, platform-orchestrated guest writes)
+    #: connect as THIS role, never as the tenant runtime role. The RLS
+    #: predicate ``app_is_platform_admin()`` requires it, so a tenant session
+    #: — or SQL injection inside one — cannot self-assert platform privilege
+    #: by setting a GUC. Credentials must differ from POSTGRES_PASSWORD;
+    #: enforced by the fail-fast guard below.
+    POSTGRES_PLATFORM_USER: str = "platform_runtime"
+    POSTGRES_PLATFORM_PASSWORD: SecretStr = SecretStr("postgres")
     DB_POOL_SIZE: int = Field(default=10, ge=1, le=100)
     DB_MAX_OVERFLOW: int = Field(default=20, ge=0, le=100)
     DB_POOL_RECYCLE_SECONDS: int = Field(default=1_800, ge=60)
@@ -210,6 +236,16 @@ class Settings(BaseSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def PLATFORM_DATABASE_URL(self) -> str:
+        """Async DSN for the platform-realm engine (separate DB login role)."""
+        pwd = self.POSTGRES_PLATFORM_PASSWORD.get_secret_value()
+        return (
+            f"postgresql+asyncpg://{self.POSTGRES_PLATFORM_USER}:{pwd}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def POLICE_DATABASE_URL(self) -> str:
         """Async DSN for the police-realm engine (separate DB role)."""
         pwd = self.POSTGRES_POLICE_PASSWORD.get_secret_value()
@@ -249,8 +285,14 @@ class Settings(BaseSettings):
             "JWT_SECRET_KEY": self.JWT_SECRET_KEY.get_secret_value(),
             "REGISTRY_HASH_SALT": self.REGISTRY_HASH_SALT.get_secret_value(),
             "POSTGRES_PASSWORD": self.POSTGRES_PASSWORD.get_secret_value(),
+            "POLICE_JWT_SECRET_KEY": (
+                self.POLICE_JWT_SECRET_KEY.get_secret_value()
+            ),
             "POSTGRES_POLICE_PASSWORD": (
                 self.POSTGRES_POLICE_PASSWORD.get_secret_value()
+            ),
+            "POSTGRES_PLATFORM_PASSWORD": (
+                self.POSTGRES_PLATFORM_PASSWORD.get_secret_value()
             ),
             "KHUR_API_KEY": self.KHUR_API_KEY.get_secret_value(),
             "EMONGOLIA_CLIENT_SECRET": (
@@ -262,11 +304,55 @@ class Settings(BaseSettings):
             if value in _INSECURE_DEFAULTS:
                 violations.append(f"{name} is set to a known development default")
 
-        for name in ("SECRET_KEY", "JWT_SECRET_KEY", "REGISTRY_HASH_SALT"):
+        for name in (
+            "SECRET_KEY",
+            "JWT_SECRET_KEY",
+            "POLICE_JWT_SECRET_KEY",
+            "REGISTRY_HASH_SALT",
+        ):
             if len(secrets_to_audit[name]) < _MIN_PROD_SECRET_LENGTH:
                 violations.append(
                     f"{name} must be at least {_MIN_PROD_SECRET_LENGTH} characters"
                 )
+
+        # --- Cross-realm / cross-role separation ------------------------- #
+        # Sharing one secret across two security domains collapses them into
+        # one: whoever steals it owns both. These are the boundaries the
+        # architecture actually depends on, so they are boot-blocking.
+        if secrets_to_audit["POLICE_JWT_SECRET_KEY"] == secrets_to_audit[
+            "JWT_SECRET_KEY"
+        ]:
+            violations.append(
+                "POLICE_JWT_SECRET_KEY must differ from JWT_SECRET_KEY "
+                "(one stolen key would mint both platform-admin and "
+                "police-dispatcher credentials)"
+            )
+        if secrets_to_audit["POSTGRES_PLATFORM_PASSWORD"] == secrets_to_audit[
+            "POSTGRES_PASSWORD"
+        ]:
+            violations.append(
+                "POSTGRES_PLATFORM_PASSWORD must differ from POSTGRES_PASSWORD "
+                "(shared credentials defeat the platform/tenant role split)"
+            )
+        if secrets_to_audit["POSTGRES_POLICE_PASSWORD"] == secrets_to_audit[
+            "POSTGRES_PASSWORD"
+        ]:
+            violations.append(
+                "POSTGRES_POLICE_PASSWORD must differ from POSTGRES_PASSWORD"
+            )
+        if self.POSTGRES_PLATFORM_USER == self.POSTGRES_USER:
+            violations.append(
+                "POSTGRES_PLATFORM_USER must be a DISTINCT login role from "
+                "POSTGRES_USER"
+            )
+        if len({self.JWT_APP_ISSUER, self.JWT_POLICE_ISSUER}) != 2:
+            violations.append(
+                "JWT_APP_ISSUER and JWT_POLICE_ISSUER must differ"
+            )
+        if len({self.JWT_APP_AUDIENCE, self.JWT_POLICE_AUDIENCE}) != 2:
+            violations.append(
+                "JWT_APP_AUDIENCE and JWT_POLICE_AUDIENCE must differ"
+            )
 
         if self.GOV_USE_MOCKS:
             violations.append(

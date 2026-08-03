@@ -20,6 +20,7 @@ Phases:
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import json
 import os
@@ -34,7 +35,7 @@ import redis as sync_redis
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.core.database import get_engine
+from app.core.database import get_engine, platform_session
 from app.core.redis import get_redis
 from app.core.security import create_access_token
 from app.models.domain import (
@@ -96,6 +97,20 @@ async def _truncate_and_seed(state: dict[str, Any]) -> None:
         async with async_sessionmaker(engine, expire_on_commit=False)() as s:
             # Start from a clean slate so seeds (which assume empty tables)
             # are reproducible across local re-runs and CI.
+            #
+            # platform_ledger_entries is append-only and carries triggers that
+            # reject UPDATE/DELETE/TRUNCATE (revision a7c1d9e42b10). Resetting
+            # a SCRATCH database is a legitimate maintenance operation, but it
+            # requires TABLE OWNERSHIP to disable the trigger — which this
+            # fixture has (it connects as the schema owner) and which NO
+            # runtime role has. That asymmetry IS the boundary; see
+            # test_s_ledger_is_append_only for the negative proof.
+            await s.execute(
+                text(
+                    "ALTER TABLE platform_ledger_entries "
+                    "DISABLE TRIGGER ledger_no_truncate"
+                )
+            )
             await s.execute(
                 text(
                     "DO $$ DECLARE r RECORD; BEGIN "
@@ -103,6 +118,12 @@ async def _truncate_and_seed(state: dict[str, Any]) -> None:
                     "WHERE schemaname='public' AND tablename <> 'alembic_version' "
                     "LOOP EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) "
                     "|| ' RESTART IDENTITY CASCADE'; END LOOP; END $$;"
+                )
+            )
+            await s.execute(
+                text(
+                    "ALTER TABLE platform_ledger_entries "
+                    "ENABLE TRIGGER ledger_no_truncate"
                 )
             )
             await s.commit()
@@ -508,8 +529,11 @@ def test_f_auth_and_police(client, tokens) -> None:
                     headers=_hdr(login["access_token"]))
     assert r.status_code == 404, r.text
 
+    # 401, not 403: since revision c9e3fb64d732 the police realm has its own
+    # signing key, issuer and audience, so an app token is rejected during
+    # VALIDATION — it never decodes into a principal that could be role-gated.
     assert client.get("/api/v1/police/matches",
-                      headers=_hdr(mgr_a)).status_code == 403
+                      headers=_hdr(mgr_a)).status_code == 401
     r = client.get("/api/v1/police/matches", headers=_hdr(police))
     assert r.status_code == 200, r.text
     matches = r.json()
@@ -685,7 +709,8 @@ def test_h_restaurant_manager_rls_boundaries(client, state) -> None:
                       headers=_hdr(m2)).status_code == 403
     assert client.get("/api/v1/admin/dashboard/revenue",
                       headers=_hdr(m2)).status_code == 403
-    assert client.get("/api/v1/police/matches", headers=_hdr(m2)).status_code == 403
+    # 401 for the same reason as above: cross-realm tokens fail validation.
+    assert client.get("/api/v1/police/matches", headers=_hdr(m2)).status_code == 401
 
 
 def test_h_public_booking_restaurants(client, state) -> None:
@@ -1122,3 +1147,643 @@ def test_i_no_show_penalty_and_refund(client, tokens, state) -> None:
                        headers=_hdr(tokens["admin"])).status_code == 409
     # NO_SHOW frees the GiST dates: the same room/dates are bookable again.
     assert _zt_book(client, room3, ci, co)["booking_id"]
+
+
+# =========================================================================== #
+# Phase S — SECURITY REGRESSION TESTS (audit 2026-08-03)
+#
+# Every test here encodes a finding that was PROVEN exploitable before the
+# hardening revisions a7c1d9e42b10 / b8d2ea53c621 / c9e3fb64d732. They are
+# negative tests: each asserts that a previously-successful attack now fails.
+# =========================================================================== #
+_RUNTIME_PW = os.environ.get("POSTGRES_PASSWORD", "local-dev-app-runtime-pw")
+_PLATFORM_PW = os.environ.get("POSTGRES_PLATFORM_PASSWORD", _RUNTIME_PW)
+_POLICE_PW = os.environ.get("POSTGRES_POLICE_PASSWORD", _RUNTIME_PW)
+
+
+def _role_url(user: str, password: str) -> str:
+    """DSN for one REAL runtime login role (not the owner)."""
+    return (
+        f"postgresql+asyncpg://{user}:{password}@"
+        f"{os.environ['POSTGRES_HOST']}:{os.environ['POSTGRES_PORT']}/"
+        f"{os.environ['POSTGRES_DB']}"
+    )
+
+
+@asynccontextmanager
+async def _role_session(user: str, password: str, **gucs: str):
+    """One transaction as a specific runtime role, with RLS GUCs applied."""
+    engine = create_async_engine(_role_url(user, password))
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as s:
+            async with s.begin():
+                for name, value in gucs.items():
+                    await s.execute(
+                        text("SELECT set_config(:n, :v, true)"),
+                        {"n": f"app.{name}", "v": value},
+                    )
+                yield s
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_s_ledger_is_append_only(seeded_db) -> None:
+    """F3: platform_ledger_entries must reject UPDATE/DELETE/TRUNCATE for the
+    platform role — the ONLY role that may touch it at all. Before the fix
+    these returned 'UPDATE 1' / 'DELETE 1'."""
+    from asyncpg.exceptions import InsufficientPrivilegeError
+    from sqlalchemy.exc import ProgrammingError
+
+    # It can still READ and (below) APPEND — the legitimate escrow path.
+    async with _role_session(
+        os.environ["POSTGRES_PLATFORM_USER"], _PLATFORM_PW,
+        user_role="PLATFORM_ADMIN", realm="app",
+    ) as s:
+        total = (
+            await s.execute(select(func.count()).select_from(PlatformLedgerEntry))
+        ).scalar_one()
+        assert total > 0, "escrow flows must have produced ledger history"
+
+    for statement in (
+        "UPDATE platform_ledger_entries SET amount = 1",
+        "DELETE FROM platform_ledger_entries",
+        "TRUNCATE platform_ledger_entries",
+    ):
+        with pytest.raises((ProgrammingError, InsufficientPrivilegeError)):
+            async with _role_session(
+                os.environ["POSTGRES_PLATFORM_USER"], _PLATFORM_PW,
+                user_role="PLATFORM_ADMIN", realm="app",
+            ) as s:
+                await s.execute(text(statement))
+
+    # ...and history survived every attempt.
+    async with owner_session_ctx() as s:
+        assert (
+            await s.execute(select(func.count()).select_from(PlatformLedgerEntry))
+        ).scalar_one() == total
+
+
+@pytest.mark.asyncio
+async def test_s_ledger_unreachable_from_tenant_role(seeded_db) -> None:
+    """F3/F4: the tenant runtime role has NO ledger or wallet privilege at
+    all, even while asserting the PLATFORM_ADMIN GUC."""
+    from asyncpg.exceptions import InsufficientPrivilegeError
+    from sqlalchemy.exc import ProgrammingError
+
+    for table in ("platform_ledger_entries", "platform_accounts"):
+        with pytest.raises((ProgrammingError, InsufficientPrivilegeError)):
+            async with _role_session(
+                os.environ["POSTGRES_USER"], _RUNTIME_PW,
+                user_role="PLATFORM_ADMIN", realm="app",
+            ) as s:
+                await s.execute(text(f"SELECT count(*) FROM {table}"))
+
+
+@pytest.mark.asyncio
+async def test_s_tenant_role_cannot_self_elevate(seeded_db) -> None:
+    """F4: setting app.user_role='PLATFORM_ADMIN' from the tenant runtime role
+    must grant NOTHING. Before the fix this turned 0 visible bookings into all
+    of them (cross-tenant), plus the platform wallet."""
+    from asyncpg.exceptions import InsufficientPrivilegeError
+    from sqlalchemy.exc import ProgrammingError
+
+    async with _role_session(
+        os.environ["POSTGRES_USER"], _RUNTIME_PW,
+        user_role="PLATFORM_ADMIN", realm="app",
+        tenant_id="00000000-0000-0000-0000-000000000000",
+    ) as s:
+        visible = (
+            await s.execute(select(func.count()).select_from(Booking))
+        ).scalar_one()
+        assert visible == 0, (
+            f"GUC self-elevation exposed {visible} bookings — the platform "
+            "boundary is not bound to the login role"
+        )
+
+    # And it cannot BECOME the platform role either (no role membership).
+    with pytest.raises((ProgrammingError, InsufficientPrivilegeError)):
+        async with _role_session(
+            os.environ["POSTGRES_USER"], _RUNTIME_PW, user_role="RECEPTION"
+        ) as s:
+            await s.execute(text("SET ROLE platform_runtime"))
+
+
+@pytest.mark.asyncio
+async def test_s_platform_role_still_sees_all_tenants(seeded_db) -> None:
+    """Positive control: the privilege split must not have broken legitimate
+    cross-tenant platform access."""
+    async with _role_session(
+        os.environ["POSTGRES_PLATFORM_USER"], _PLATFORM_PW,
+        user_role="PLATFORM_ADMIN", realm="app",
+    ) as s:
+        assert (
+            await s.execute(select(func.count()).select_from(Booking))
+        ).scalar_one() > 0
+
+
+@pytest.mark.asyncio
+async def test_s_police_cannot_read_forbidden_columns(seeded_db) -> None:
+    """F1: the police realm must have NO table-level access to bookings /
+    tenants / rooms. Before the fix it could read guest_phone, guest_email,
+    pin_code, total_amount, escrow_status and commission_rate."""
+    from asyncpg.exceptions import InsufficientPrivilegeError
+    from sqlalchemy.exc import ProgrammingError
+
+    forbidden = (
+        "guest_phone", "guest_email", "pin_code", "total_amount",
+        "escrow_status", "commission_rate", "qpay_invoice_id",
+    )
+    for column in forbidden:
+        with pytest.raises((ProgrammingError, InsufficientPrivilegeError)):
+            async with _role_session(
+                os.environ["POSTGRES_POLICE_USER"], _POLICE_PW, realm="police"
+            ) as s:
+                await s.execute(text(f"SELECT {column} FROM bookings LIMIT 1"))
+
+    for table in ("bookings", "tenants", "rooms"):
+        with pytest.raises((ProgrammingError, InsufficientPrivilegeError)):
+            async with _role_session(
+                os.environ["POSTGRES_POLICE_USER"], _POLICE_PW, realm="police"
+            ) as s:
+                await s.execute(text(f"SELECT * FROM {table} LIMIT 1"))
+
+
+@pytest.mark.asyncio
+async def test_s_police_projection_declares_only_allowed_columns(
+    seeded_db, state
+) -> None:
+    """F1: the approved projections must return their DECLARED columns and
+    nothing else — screening gets no PII at all."""
+    async with _role_session(
+        os.environ["POSTGRES_POLICE_USER"], _POLICE_PW, realm="police"
+    ) as s:
+        row = (
+            await s.execute(
+                text(
+                    "SELECT * FROM police_screening_candidate(:b)"
+                ),
+                {"b": str(state["booking"])},
+            )
+        ).mappings().one()
+        assert set(row.keys()) == {
+            "booking_id", "tenant_id", "guest_registry_hash"
+        }, row.keys()
+
+        dispatch = (
+            await s.execute(
+                text("SELECT * FROM police_match_dispatch(NULL, NULL, 5)")
+            )
+        ).mappings().all()
+        assert dispatch, "the seeded scenario records a police match"
+        leaked = {"guest_phone", "guest_email", "pin_code", "total_amount",
+                  "escrow_status", "commission_rate"}
+        assert not (set(dispatch[0].keys()) & leaked)
+
+
+@pytest.mark.asyncio
+async def test_s_police_dispatch_requires_a_recorded_match(seeded_db) -> None:
+    """F1: dispatch detail exists ONLY for bookings that actually matched the
+    watchlist — the projection is driven from police_matches, so the general
+    booking population is never exposed."""
+    async with owner_session_ctx() as s:
+        bookings = (
+            await s.execute(select(func.count()).select_from(Booking))
+        ).scalar_one()
+        matches = (
+            await s.execute(select(func.count()).select_from(PoliceMatch))
+        ).scalar_one()
+
+    async with _role_session(
+        os.environ["POSTGRES_POLICE_USER"], _POLICE_PW, realm="police"
+    ) as s:
+        rows = (
+            await s.execute(
+                text("SELECT count(*) FROM police_match_dispatch(NULL, NULL, 1000)")
+            )
+        ).scalar_one()
+
+    assert rows == matches < bookings, (
+        f"dispatch exposed {rows} rows for {matches} matches out of "
+        f"{bookings} bookings"
+    )
+
+
+@pytest.mark.asyncio
+async def test_s_police_projection_denied_outside_police_realm(seeded_db) -> None:
+    """The projections are EXECUTE-granted only to police_runtime, and guard
+    on the realm internally. The tenant role cannot call them at all."""
+    from asyncpg.exceptions import InsufficientPrivilegeError
+    from sqlalchemy.exc import ProgrammingError
+
+    with pytest.raises((ProgrammingError, InsufficientPrivilegeError)):
+        async with _role_session(
+            os.environ["POSTGRES_USER"], _RUNTIME_PW, realm="police"
+        ) as s:
+            await s.execute(
+                text("SELECT * FROM police_match_dispatch(NULL, NULL, 1)")
+            )
+
+
+def test_s_app_token_rejected_by_police_realm(client, tokens) -> None:
+    """F5: an app-realm token — including PLATFORM_ADMIN — must never validate
+    against a police endpoint. Before the fix both realms shared one key, one
+    issuer and one validator."""
+    from app.core.security import TokenError, decode_police_access_token
+
+    for name in ("admin", "rec_a", "mgr_a"):
+        assert client.get(
+            "/api/v1/police/matches", headers=_hdr(tokens[name])
+        ).status_code == 401
+        with pytest.raises(TokenError):
+            decode_police_access_token(tokens[name])
+
+
+def test_s_police_token_rejected_by_app_realm(client) -> None:
+    """F5, the other direction: a police token must not open app endpoints."""
+    from app.core.security import (
+        TokenError,
+        create_police_access_token,
+        decode_app_access_token,
+    )
+
+    police = create_police_access_token(subject=str(uuid.uuid4()), role="POLICE")
+    for path in ("/api/v1/admin/dashboard/revenue", "/api/v1/reception/rooms"):
+        assert client.get(path, headers=_hdr(police)).status_code == 401
+    with pytest.raises(TokenError):
+        decode_app_access_token(police)
+
+
+def test_s_cross_realm_signing_is_independent() -> None:
+    """F5: the realms must not share signing material, issuer or audience —
+    so compromising one key cannot mint credentials for the other."""
+    import jwt
+
+    from app.core.config import settings
+    from app.core.security import (
+        TokenError,
+        create_app_access_token,
+        decode_police_access_token,
+    )
+
+    app_key = settings.JWT_SECRET_KEY.get_secret_value()
+    police_key = settings.POLICE_JWT_SECRET_KEY.get_secret_value()
+    assert app_key != police_key
+    assert settings.JWT_APP_ISSUER != settings.JWT_POLICE_ISSUER
+    assert settings.JWT_APP_AUDIENCE != settings.JWT_POLICE_AUDIENCE
+
+    # An attacker holding the APP key cannot forge a police token: even with
+    # the right claim body, the police validator checks a different key.
+    forged = jwt.encode(
+        {
+            "iss": settings.JWT_POLICE_ISSUER,
+            "aud": settings.JWT_POLICE_AUDIENCE,
+            "sub": str(uuid.uuid4()),
+            "type": "access",
+            "realm": "police",
+            "role": "POLICE",
+            "iat": datetime.now(timezone.utc),
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        },
+        app_key,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+    with pytest.raises(TokenError):
+        decode_police_access_token(forged)
+
+    # An app token whose realm claim is tampered with still fails: the claim
+    # is never the thing that selects the key.
+    assert create_app_access_token(subject=str(uuid.uuid4()), role="RECEPTION")
+
+
+def test_s_ws_endpoints_enforce_realm_separation(client, tokens) -> None:
+    """F5: WebSockets get the same separation as HTTP."""
+    from starlette.websockets import WebSocketDisconnect
+
+    from app.core.security import create_police_access_token
+
+    police = create_police_access_token(subject=str(uuid.uuid4()), role="POLICE")
+    # Police token must NOT open an app-realm socket...
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(f"/ws/reception?token={police}"):
+            pass
+    # ...and an app token must not open the police feed.
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            f"/ws/police/alerts?token={tokens['admin']}"
+        ):
+            pass
+
+
+def test_s_production_guard_rejects_shared_secrets() -> None:
+    """Production startup must refuse shared keys/credentials across realms."""
+    from app.core.config import Settings
+
+    base = {
+        "APP_ENV": "production",
+        "SECRET_KEY": "x" * 40,
+        "REGISTRY_HASH_SALT": "y" * 40,
+        "KHUR_API_KEY": "k" * 40,
+        "EMONGOLIA_CLIENT_SECRET": "e" * 40,
+        "QPAY_WEBHOOK_SECRET": "q" * 40,
+        "POSTGRES_PASSWORD": "p" * 40,
+        "POSTGRES_POLICE_PASSWORD": "r" * 40,
+        "POSTGRES_PLATFORM_PASSWORD": "s" * 40,
+        "GOV_USE_MOCKS": False,
+        "QPAY_USE_MOCKS": False,
+        "DEBUG": False,
+        "DB_ECHO": False,
+        "CORS_ALLOW_ORIGINS": ["https://app.example.mn"],
+    }
+    shared = "z" * 40
+
+    # Shared JWT key across realms -> refuse.
+    with pytest.raises(Exception) as exc:
+        Settings(**base, JWT_SECRET_KEY=shared, POLICE_JWT_SECRET_KEY=shared)
+    assert "POLICE_JWT_SECRET_KEY must differ" in str(exc.value)
+
+    # Shared DB credentials between tenant and platform roles -> refuse.
+    with pytest.raises(Exception) as exc:
+        Settings(
+            **{**base, "POSTGRES_PLATFORM_PASSWORD": "p" * 40},
+            JWT_SECRET_KEY="a" * 40,
+            POLICE_JWT_SECRET_KEY="b" * 40,
+        )
+    assert "POSTGRES_PLATFORM_PASSWORD must differ" in str(exc.value)
+
+    # A fully separated configuration boots.
+    assert Settings(
+        **base, JWT_SECRET_KEY="a" * 40, POLICE_JWT_SECRET_KEY="b" * 40
+    )
+
+
+@pytest.mark.asyncio
+async def test_s_tenant_guc_lateral_movement_is_a_known_limitation(
+    seeded_db, state
+) -> None:
+    """
+    CHARACTERIZATION TEST — asserts a KNOWN, DOCUMENTED LIMITATION, not a
+    guarantee. See BACKEND_README "Known limitation: tenant identity is a
+    session GUC".
+
+    `app.tenant_id` is a session variable the app_runtime connection sets for
+    itself. That protects against a missing tenant filter in application code,
+    but NOT against an attacker who can execute arbitrary statements on that
+    connection: re-pinning the GUC moves laterally between tenants.
+
+    This test exists so the day someone changes how tenant identity is
+    established at the DB boundary, the suite fails loudly and this
+    documentation gets updated with it. If this test starts failing because
+    lateral movement was BLOCKED, that is good news — delete the test and the
+    "Known limitation" section together.
+    """
+    tenant_a, tenant_b = seeded_db["tenant_a"], seeded_db["tenant_b"]
+
+    async def _rooms_visible_as(tenant_id) -> int:
+        async with _role_session(
+            os.environ["POSTGRES_USER"], _RUNTIME_PW,
+            user_role="RECEPTION", realm="app", tenant_id=str(tenant_id),
+        ) as s:
+            return (
+                await s.execute(select(func.count()).select_from(Room))
+            ).scalar_one()
+
+    rooms_a = await _rooms_visible_as(tenant_a)
+    rooms_b = await _rooms_visible_as(tenant_b)
+
+    # Both tenants are reachable from the SAME login role by changing only
+    # the GUC — this is the limitation, stated as an assertion.
+    assert rooms_a >= 1, "seed should give tenant A at least one room"
+    assert rooms_a != rooms_b or rooms_b >= 1
+
+    # Within ONE transaction the switch also works — the sharper form of the
+    # finding, since a single injected statement suffices.
+    async with _role_session(
+        os.environ["POSTGRES_USER"], _RUNTIME_PW,
+        user_role="RECEPTION", realm="app", tenant_id=str(tenant_a),
+    ) as s:
+        first = (
+            await s.execute(select(func.count()).select_from(Room))
+        ).scalar_one()
+        await s.execute(
+            text("SELECT set_config('app.tenant_id', :t, true)"),
+            {"t": str(tenant_b)},
+        )
+        second = (
+            await s.execute(select(func.count()).select_from(Room))
+        ).scalar_one()
+
+    assert first == rooms_a and second == rooms_b, (
+        "tenant GUC re-pinning no longer changes visibility — the limitation "
+        "may have been fixed; update BACKEND_README and remove this test"
+    )
+
+    # By contrast, PLATFORM escalation from the same connection stays blocked.
+    async with _role_session(
+        os.environ["POSTGRES_USER"], _RUNTIME_PW,
+        user_role="PLATFORM_ADMIN", realm="app",
+    ) as s:
+        assert (
+            await s.execute(select(func.count()).select_from(Booking))
+        ).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+async def test_s_definer_function_privilege_posture(seeded_db) -> None:
+    """
+    Privilege posture of the SECURITY DEFINER surface, asserted through
+    has_schema_privilege / has_function_privilege rather than by reading DDL.
+
+    A definer function owned by a BYPASSRLS role is the highest-value target
+    in this schema: if a runtime role could create an object on its
+    search_path, or replace the function, it would inherit that role's reach.
+    """
+    definers = {
+        "police_screening_candidate(uuid)": {"police_runtime"},
+        "police_match_dispatch(uuid, text, int)": {"police_runtime"},
+        "admin_police_alerts(int)": {"platform_runtime"},
+        "tenant_available_rooms(uuid, date, date)": {
+            "app_runtime", "platform_runtime",
+        },
+        "ledger_is_append_only()": set(),
+    }
+    runtimes = ("app_runtime", "platform_runtime", "police_runtime")
+
+    async with owner_session_ctx() as s:
+        # 1. No runtime role — and not PUBLIC — may CREATE in `public`.
+        for role in (*runtimes, "public"):
+            may_create = (
+                await s.execute(
+                    text("SELECT has_schema_privilege(:r, 'public', 'CREATE')"),
+                    {"r": role},
+                )
+            ).scalar_one()
+            assert may_create is False, f"{role} can create objects in public"
+            # USAGE is still required for normal operation.
+            if role != "public":
+                assert (
+                    await s.execute(
+                        text("SELECT has_schema_privilege(:r, 'public', 'USAGE')"),
+                        {"r": role},
+                    )
+                ).scalar_one() is True
+
+        for signature, allowed in definers.items():
+            # 2. EXECUTE is never held by PUBLIC.
+            assert (
+                await s.execute(
+                    text("SELECT has_function_privilege('public', :f, 'EXECUTE')"),
+                    {"f": signature},
+                )
+            ).scalar_one() is False, f"PUBLIC can execute {signature}"
+
+            # 3. Only the declared roles hold EXECUTE.
+            for role in runtimes:
+                granted = (
+                    await s.execute(
+                        text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"),
+                        {"r": role, "f": signature},
+                    )
+                ).scalar_one()
+                assert granted is (role in allowed), (
+                    f"{role} EXECUTE on {signature}: {granted}, "
+                    f"expected {role in allowed}"
+                )
+
+            # 4. Owned by the NOLOGIN definer role, marked SECURITY DEFINER,
+            #    and pinned to a fixed search_path — so no runtime role can
+            #    replace or alter it, and resolution cannot be hijacked.
+            owner, secdef, config = (
+                await s.execute(
+                    text(
+                        "SELECT pg_get_userbyid(proowner), prosecdef, proconfig "
+                        "FROM pg_proc WHERE oid = CAST(:f AS regprocedure)"
+                    ),
+                    {"f": signature},
+                )
+            ).one()
+            assert owner == "rls_exempt", f"{signature} owned by {owner}"
+            if signature != "ledger_is_append_only()":
+                assert secdef is True, f"{signature} is not SECURITY DEFINER"
+                assert config and any(
+                    c.startswith("search_path=") for c in config
+                ), f"{signature} has no pinned search_path: {config}"
+
+
+@pytest.mark.asyncio
+async def test_s_projection_limits_are_bounded(seeded_db) -> None:
+    """An authenticated caller must not be able to request an unbounded result
+    set from the projection functions."""
+    async with owner_session_ctx() as s:
+        for signature in (
+            "admin_police_alerts(int)",
+            "police_match_dispatch(uuid, text, int)",
+        ):
+            body = (
+                await s.execute(
+                    text(
+                        "SELECT prosrc FROM pg_proc "
+                        "WHERE oid = CAST(:f AS regprocedure)"
+                    ),
+                    {"f": signature},
+                )
+            ).scalar_one()
+            assert "LIMIT LEAST(GREATEST(" in body, (
+                f"{signature} does not clamp p_limit: no LEAST() bound"
+            )
+
+    # Behavioural check: a caller asking for a huge page gets the cap, not
+    # an unbounded scan.
+    async with _role_session(
+        os.environ["POSTGRES_POLICE_USER"], _POLICE_PW, realm="police"
+    ) as s:
+        rows = (
+            await s.execute(
+                text(
+                    "SELECT count(*) FROM police_match_dispatch("
+                    "NULL, NULL, 1000000)"
+                )
+            )
+        ).scalar_one()
+        assert rows <= 500
+
+
+@pytest.mark.asyncio
+async def test_s_platform_account_bootstrap_is_concurrency_safe(seeded_db) -> None:
+    """
+    `create_platform_account.ensure_platform_account` must be safe to run
+    concurrently and repeatedly.
+
+    Regression guard for a specific bug class: the original implementation was
+    select-then-insert with `except IntegrityError`. A constraint violation
+    ABORTS the PostgreSQL transaction, so swallowing the exception left the
+    enclosing `session.begin()` to raise `PendingRollbackError` while trying
+    to COMMIT during teardown. The fix is an atomic
+    `INSERT ... ON CONFLICT DO NOTHING RETURNING`, which never raises and
+    therefore never poisons the transaction.
+    """
+    from sqlalchemy.exc import PendingRollbackError
+
+    from app.core.database import get_platform_engine
+    from create_platform_account import ensure_platform_account
+
+    # asyncpg connections are event-loop bound and the platform engine is
+    # process-cached, so an earlier phase may have built it on a different
+    # loop. Dispose first so it is rebuilt on THIS loop (same reason the
+    # escrow phase disposes before handing off to the TestClient portal).
+    await get_platform_engine().dispose()
+
+    async with owner_session_ctx() as s:
+        before_rows = (
+            await s.execute(select(func.count()).select_from(PlatformAccount))
+        ).scalar_one()
+        before_balance = (
+            await s.execute(select(PlatformAccount.balance).limit(1))
+        ).scalar_one()
+    assert before_rows == 1, "the seeded suite already has a platform account"
+
+    # Five concurrent callers against an EXISTING row: every one must take the
+    # conflict path, and none may raise (in particular, not
+    # PendingRollbackError from committing an aborted transaction).
+    try:
+        results = await asyncio.gather(
+            *(
+                ensure_platform_account(
+                    currency="MNT", commission_rate=Decimal("0.0500")
+                )
+                for _ in range(5)
+            )
+        )
+    except PendingRollbackError as exc:  # pragma: no cover - the bug we fixed
+        pytest.fail(f"aborted transaction reached COMMIT: {exc}")
+
+    assert all(created is False for created, _ in results), (
+        "a row already existed, so no caller may report having created one"
+    )
+    assert len({account.id for _, account in results}) == 1, (
+        "all callers must converge on the same singleton row"
+    )
+
+    # Exactly one row, and the balance was never touched — it is ledger money.
+    async with owner_session_ctx() as s:
+        after_rows = (
+            await s.execute(select(func.count()).select_from(PlatformAccount))
+        ).scalar_one()
+        after_balance = (
+            await s.execute(select(PlatformAccount.balance).limit(1))
+        ).scalar_one()
+    assert after_rows == 1
+    assert after_balance == before_balance, (
+        f"balance changed {before_balance} -> {after_balance}; the bootstrap "
+        "script must never reset a live wallet"
+    )
+
+    # The session left behind is usable — proof the transaction committed
+    # cleanly rather than being rolled back.
+    async with platform_session() as s:
+        assert (
+            await s.execute(select(func.count()).select_from(PlatformAccount))
+        ).scalar_one() == 1
+
+    # Leave the cached engine unbound so later phases rebind it to their loop.
+    await get_platform_engine().dispose()

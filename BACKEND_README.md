@@ -47,7 +47,7 @@ transaction-scoped GUCs (`SET LOCAL app.*`) which the RLS policies read:
 | Realm | DB login role | Sees |
 |---|---|---|
 | **App / hotel** | `app_runtime` | rows where `tenant_id` (or `restaurant_id`) matches the caller's token; `FORCE ROW LEVEL SECURITY` applies even to the table owner |
-| **Platform** | `app_runtime` (GUC `app.user_role = PLATFORM_ADMIN`) | all tenants — for reconciliation, wallets, the append-only ledger |
+| **Platform** | `platform_runtime` (**separate login role**) + GUC `app.user_role = PLATFORM_ADMIN` | all tenants — for reconciliation, wallets, the append-only ledger |
 | **Police** | `police_runtime` (**separate DB credentials**) | its own `police_officers` / `wanted_persons` / `police_matches` / audit tables; `app_runtime` holds `REVOKE ALL` on these |
 | **Marketplace** | `app_runtime` (GUC `app.realm = marketplace`) | public reads only: active hotels/rooms/restaurants/available menu items |
 
@@ -160,11 +160,162 @@ tenant.platform_fee_percent / 100`. The escrow release reads that *snapshotted*
   locked transaction: lock the payable → credit the platform (with a ledger
   entry) → credit the merchant wallet → flip escrow to `RELEASED`.
 
-The `platform_ledger_entries` table is **append-only and authoritative**; the
-wallet balances are a cache reconciled against it. QPay payment funding is
+The `platform_ledger_entries` table is **append-only and authoritative**, and
+since revision `a7c1d9e42b10` that is enforced by PostgreSQL rather than by
+convention: no runtime role holds `UPDATE`/`DELETE`/`TRUNCATE`, the RLS
+policies are `FOR SELECT` + `FOR INSERT` only (so no policy could admit a
+mutation even if a privilege were mistakenly re-granted), and a trigger owned
+by the NOLOGIN `rls_exempt` role raises on any attempt — runtime roles cannot
+disable or replace it, because that requires ownership. Refunds, corrections
+and chargebacks are posted as **new compensating entries**. Wallet balances
+are a cache reconciled against the ledger. QPay payment funding is
 **idempotent by construction** — a single
 `UPDATE ... WHERE status='PENDING' RETURNING id` funds each booking/order
 exactly once no matter how many times (or how concurrently) the webhook fires.
+
+---
+
+## 3b. Security boundaries — what is and is not enforced
+
+Written after the 2026-08-03 adversarial audit. Every row states only what is
+actually enforced by code or by the database; the "not defended" column is
+deliberately explicit, because an overstated guarantee is worse than a known
+gap.
+
+| Boundary | Enforced by | Defends against | Does **not** defend against |
+|---|---|---|---|
+| Tenant isolation | RLS policies on `tenant_id` (`FORCE ROW LEVEL SECURITY`), driven by the `app.tenant_id` GUC | a missing `WHERE` clause in application code; a tampered tenant claim in a JWT (signature validation rejects it before the GUC is ever set) | **arbitrary SQL execution under `app_runtime`, and leaked `app_runtime` credentials** — both can re-pin `app.tenant_id` to another tenant. See "Known limitation" below |
+| Platform privilege | `app_is_platform_admin()` requires `session_user = 'platform_runtime'` **and** the role GUC; `app_runtime` is not a member of that role, so `SET ROLE` fails | SQL injection inside a tenant request; a leaked `app_runtime` password | compromise of the app host, which can read the platform DSN from its own environment |
+| Ledger immutability | no `UPDATE`/`DELETE`/`TRUNCATE` privilege for any runtime role; `FOR SELECT` + `FOR INSERT` policies only; trigger owned by NOLOGIN `rls_exempt` | any runtime role rewriting or erasing financial history | a database superuser (who could drop the table); this is why superuser credentials are not used at runtime |
+| Police data isolation | `REVOKE ALL` on police tables from `app_runtime`/`platform_runtime`; police reads business data only via two fixed `SECURITY DEFINER` projections | SQL injection under an app credential; column over-exposure to the police realm | **compromise of the app host — see below** |
+| Cross-realm tokens | separate signing keys, issuers and audiences; realm-specific decoders (`decode_app_access_token` / `decode_police_access_token`); the realm is an input to validation, never read from the token first | a stolen app key minting police credentials, and vice versa; alg confusion; audience replay | theft of *both* keys |
+
+### Known limitation: tenant identity is a session GUC (MEDIUM, open)
+
+`app.tenant_id` is a session variable that the `app_runtime` connection sets
+for itself. That is exactly what makes it robust against *application* bugs —
+a forgotten `WHERE tenant_id = ...` cannot leak another hotel's rows, because
+the policy applies regardless. It is **not** robust against an attacker who
+can execute arbitrary statements on that connection.
+
+Proven against the hardened database:
+
+```
+-- as app_runtime, one transaction
+SET LOCAL app.user_role = 'RECEPTION';
+SET LOCAL app.tenant_id = '<tenant A>';   SELECT count(*) FROM rooms;  -- 1
+SET LOCAL app.tenant_id = '<tenant B>';   SELECT count(*) FROM rooms;  -- 3
+```
+
+So the threat model must be stated precisely:
+
+| Scenario | Outcome |
+|---|---|
+| Missing tenant filter in a query | **Protected** — the policy filters anyway |
+| Malicious JWT with an altered tenant claim | **Protected** — signature validation rejects the token; the GUC is never set from an unverified claim |
+| Arbitrary SQL execution under `app_runtime` | **NOT protected** — the attacker re-pins `app.tenant_id` and moves laterally between tenants |
+| Leaked `app_runtime` credentials | **NOT protected** — same self-assertion, no application involved |
+| Escalation to platform scope (wallet, ledger, cross-tenant) | **Protected** — requires `session_user = 'platform_runtime'`, a distinct login role with no membership path from `app_runtime` (revision `c9e3fb64d732`) |
+
+Note the asymmetry that the platform work introduced: privilege *escalation*
+is now bound to a DB login role, but *lateral* movement within the tenant tier
+is not, because all tenants share one runtime role.
+
+**Why this is not closed here.** Closing it means changing how tenant identity
+is established at the database boundary, and every available option is a
+larger architectural change than this audit's scope:
+
+* a login role per tenant (identity becomes `session_user`) — does not scale to
+  a marketplace with thousands of hotels, and turns onboarding into role
+  provisioning;
+* a connection pool keyed by tenant with `SET SESSION AUTHORIZATION` — requires
+  superuser to switch back, so it moves the problem rather than solving it;
+* signed tenant context verified inside the policy (e.g. the GUC carries an
+  HMAC over `tenant_id` that a `SECURITY DEFINER` verifier checks against a key
+  the runtime role cannot read) — viable, and the smallest sound design, but it
+  changes every session-open path and needs its own key-management story.
+
+Until one of those lands, tenant RLS should be described as **a guard against
+application bugs, not a containment boundary for a compromised app credential**.
+`test_s_tenant_guc_lateral_movement_is_a_known_limitation` characterises the
+current behaviour so that any future change to it fails the suite loudly.
+
+### Unresolved: police process boundary (HIGH)
+
+The police realm has its own DB role, its own signing key and its own engine —
+but it still runs **inside the same FastAPI process** as the public and hotel
+application, and that process holds `POSTGRES_POLICE_PASSWORD` and
+`POLICE_JWT_SECRET_KEY` in its own environment. Anyone who achieves code
+execution or arbitrary file read on the application host obtains both.
+
+**Separate PostgreSQL credentials inside one process are not a process,
+host, secret, or deployment boundary.** Any claim that "a fully compromised
+app server cannot read police data" is false until all of the following hold:
+
+1. separate process / deployment entrypoints for the app and police workloads;
+2. separately injected secrets, with the police secrets absent from the
+   public/hotel process environment;
+3. network restrictions so only the police workload can reach the police
+   database role;
+4. no police database password or police JWT key in the public/hotel process.
+
+Until then this remains an open HIGH-severity finding, tracked here rather
+than described as mitigated.
+
+---
+
+### Deployment compatibility — BREAKING changes in this security release
+
+These changes are **not backward compatible at runtime**. Read before rolling out.
+
+**1. All existing JWTs become invalid.** Tokens are now validated against
+realm-specific keys, issuers and audiences, and the `aud` claim is required.
+Every token issued before this release fails validation — app *and* police.
+There is no grace period and no dual-validation fallback, deliberately:
+accepting old tokens would mean keeping the shared-key path alive, which is
+the vulnerability. **All users must authenticate again after deployment.**
+Expect a burst of 401s and re-logins; make sure the frontend treats a 401 as
+"redirect to login" rather than as an error state.
+
+**2. Environment variables must be provisioned BEFORE rollout.** The
+application will not start without them, and in production the fail-fast guard
+additionally requires them to be distinct:
+
+| Variable | Notes |
+|---|---|
+| `POLICE_JWT_SECRET_KEY` | must differ from `JWT_SECRET_KEY`, ≥32 chars |
+| `POSTGRES_PLATFORM_USER` | must differ from `POSTGRES_USER` |
+| `POSTGRES_PLATFORM_PASSWORD` | must differ from `POSTGRES_PASSWORD` |
+| `JWT_APP_ISSUER` / `JWT_APP_AUDIENCE` | defaults are fine; must differ from the police pair |
+| `JWT_POLICE_ISSUER` / `JWT_POLICE_AUDIENCE` | as above |
+
+**3. Migration and rollout must be ordered — the old application is NOT
+compatible with the new grants.** Revision `c9e3fb64d732` removes
+`app_runtime`'s access to `platform_accounts` and `platform_ledger_entries`
+and rebinds `app_is_platform_admin()` to `session_user = 'platform_runtime'`.
+An old application instance still connecting as `app_runtime` for platform
+work will fail every escrow settlement, admin dashboard and platform-
+orchestrated booking write once those migrations land.
+
+Required order:
+
+1. Create and password the `platform_runtime` role in the target database
+   (out of band, real secret — **not** `scripts/provision_local_roles.sql`,
+   which is local-only).
+2. Provision the new environment variables on the new application version.
+3. Deploy the new application version **and** run `alembic upgrade head`
+   together, as a single cutover — not a rolling deploy that leaves old
+   instances serving traffic.
+4. Verify: admin revenue dashboard `200`, a police login `200`, and an
+   app-realm token against a police endpoint `401`.
+
+If a rolling deploy is unavoidable, the migrations must land *after* every old
+instance has been drained. There is no window in which old and new
+application versions are both correct against the same database.
+
+**4. Rollback.** All four revisions have downgrades, but each re-opens the
+finding it closed (documented in the revision docstrings). A rollback also
+does not re-validate old tokens — users must log in again either way.
 
 ---
 
@@ -211,15 +362,50 @@ export MIGRATIONS_DATABASE_URL='postgresql+psycopg://hotel:<owner-password>@loca
 alembic upgrade head
 ```
 
-This creates the schema, the `app_runtime` / `police_runtime` / `rls_exempt`
-roles, all RLS policies, and helper functions.
+This creates the schema, the `app_runtime` / `platform_runtime` /
+`police_runtime` / `rls_exempt` roles, all RLS policies, and helper functions.
 
-### 5. Bootstrap a platform admin
+### 4b. Provision the local runtime role passwords
+
+Migrations create the runtime login roles but deliberately **do not set usable
+passwords** — a migration is source-controlled and replayed everywhere, so it
+must never carry a credential. Roles are created with the placeholder
+`CHANGE_ME_IN_PRODUCTION`, and an existing role's password is never
+overwritten. Assign the local development passwords (the ones `.env.example`
+ships) with:
 
 ```bash
+docker exec -i hotel-platform-postgres psql -U hotel -d hotel_marketplace -v ON_ERROR_STOP=1 < scripts/provision_local_roles.sql
+```
+
+Repeat for the E2E scratch database if you will run the test suite:
+
+```bash
+docker exec -i hotel-platform-postgres psql -U hotel -d hotel_marketplace_test -v ON_ERROR_STOP=1 < scripts/provision_local_roles.sql
+```
+
+(Roles are cluster-wide, so the second run is a no-op for the passwords; it is
+listed only so the command is obvious when you bootstrap the test DB.)
+
+**In production, do not run this script.** Assign real secrets out of band
+(`ALTER ROLE ... PASSWORD ...` from your secret manager) and set
+`POSTGRES_PASSWORD`, `POSTGRES_PLATFORM_PASSWORD` and
+`POSTGRES_POLICE_PASSWORD` to match. Startup refuses any placeholder, and
+refuses platform/police credentials that equal the tenant credential.
+
+### 5. Bootstrap the platform account and first accounts
+
+```bash
+python3 create_platform_account.py # singleton platform wallet (REQUIRED)
 python3 create_admin.py            # -> admin@hotel.mn / Admin123!
 python3 create_police_officer.py   # -> badge P-1000  / Police123!
 ```
+
+`create_platform_account.py` seeds the single `platform_accounts` row that
+escrow settlement credits and the admin revenue dashboard reads. Without it a
+fresh install looks healthy until the first platform operation, which then
+fails with `NoResultFound` (500) or `PlatformAccountMissingError`. All three
+scripts are idempotent and never overwrite existing rows or balances.
 
 ### 6. Run the server
 

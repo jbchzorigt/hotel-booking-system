@@ -34,7 +34,11 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from redis.asyncio import Redis
 
 from app.core.redis import get_redis
-from app.dependencies.auth import AuthContext, authenticate_ws_token
+from app.dependencies.auth import (
+    AuthContext,
+    authenticate_app_ws_token,
+    authenticate_police_ws_token,
+)
 from app.models.domain import UserRole
 from app.services.police_service import POLICE_ALERT_CHANNEL
 
@@ -160,7 +164,7 @@ async def _reject(websocket: WebSocket) -> None:
 @ws_router.websocket("/ws/police/alerts")
 async def police_alerts_ws(websocket: WebSocket) -> None:
     """Police dashboard feed — realm-gated, all hotels, all matches."""
-    ctx: AuthContext | None = authenticate_ws_token(
+    ctx: AuthContext | None = authenticate_police_ws_token(
         websocket.query_params.get("token")
     )
     if ctx is None or ctx.realm != "police":
@@ -174,7 +178,7 @@ async def police_alerts_ws(websocket: WebSocket) -> None:
 async def reception_ws(websocket: WebSocket) -> None:
     """Reception screen feed — minibar reports, (later) new bookings.
     Topic derives from the token's tenant_id, never from the client."""
-    ctx = authenticate_ws_token(websocket.query_params.get("token"))
+    ctx = authenticate_app_ws_token(websocket.query_params.get("token"))
     if ctx is None or ctx.realm != "app" or ctx.role not in _RECEPTION_WS_ROLES:
         await _reject(websocket)
         return
@@ -186,7 +190,7 @@ async def reception_ws(websocket: WebSocket) -> None:
 @ws_router.websocket("/ws/restaurant/orders")
 async def restaurant_orders_ws(websocket: WebSocket) -> None:
     """Restaurant owner feed — incoming food orders (wired in Phase 4)."""
-    ctx = authenticate_ws_token(websocket.query_params.get("token"))
+    ctx = authenticate_app_ws_token(websocket.query_params.get("token"))
     if (
         ctx is None
         or ctx.realm != "app"

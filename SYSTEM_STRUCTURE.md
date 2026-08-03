@@ -56,19 +56,37 @@ Final Project/
    `app.user_role`). Postgres RLS — not application code — is the last line of
    defense. Realms: `app` (hotel/restaurant/platform), `police`, `marketplace`
    (public reads). `scripts/enable_rls.sql` is the single source of truth.
-2. **Police-realm hard isolation.** The app's DB role (`app_runtime`) has
+2. **Police-realm DB-role isolation.** The app's DB role (`app_runtime`) has
    `REVOKE ALL` on `wanted_persons` / `police_matches` / `police_officers` /
    `police_audit_logs`. The police matcher/API run as a separate role
-   (`police_runtime`). Even a fully compromised app server cannot read police
-   data. The one bridge is a `SECURITY DEFINER` function returning a **redacted**
-   projection to platform admins.
+   (`police_runtime`), which since revision `b8d2ea53c621` holds **no
+   table-level access to `bookings` / `tenants` / `rooms` either** — RLS
+   filters rows, not columns, so a table grant would have exposed guest phone,
+   email, the arrival PIN and all escrow state. Business data now reaches the
+   police realm only through two fixed `SECURITY DEFINER` projections:
+   `police_screening_candidate()` (hash + ids, zero PII) and
+   `police_match_dispatch()` (dispatch detail, and only for a **recorded
+   match**). A separate redacted projection serves platform admins.
+
+   ⚠️ **Unresolved, HIGH severity — this is a DB-role boundary, not a process
+   boundary.** The app and police workloads still run in ONE FastAPI process
+   which holds BOTH DSNs in its environment. Compromise of the application
+   host therefore still yields the police credentials. Role separation defends
+   against SQL injection and a single leaked credential; it does **not**
+   defend against host compromise. Closing this requires separate deployment
+   entrypoints, separately injected secrets, network restrictions, and no
+   police DSN in the public/hotel process. See BACKEND_README
+   "Security boundaries".
 3. **PII minimization.** Raw registry numbers (РД) are **never stored** — only a
    salted HMAC hash (`compute_registry_hash`). Matching is a hash-equality join.
 4. **Escrow payment model + zero-trust release.** The platform is merchant of
    record. Funds are **HELD** on payment and **RELEASED** (merchant share /
    platform commission) only on **verified guest arrival** — a 6-digit PIN
    check at reception, an admin manual override, or a no-show penalty — not
-   merely on payment. Money movements are append-only ledger entries.
+   merely on payment. Money movements are append-only ledger entries —
+   enforced in the database since revision `a7c1d9e42b10` (privileges,
+   policies and an ownership-protected trigger), not merely by convention.
+   Corrections are new compensating entries, never edits.
 5. **Dynamic per-tenant fee, snapshotted.** Each `Tenant` has an editable
    `platform_fee_percent` (default 5%). The rate is **frozen onto each payable
    at creation** as `commission_rate = platform_fee_percent / 100`; the release

@@ -59,3 +59,6 @@ Thumbs.db
 
 # User-uploaded content (menu images) — never commit
 static/uploads/
+
+# Claude Code session/config directory — local tooling, never committed.
+.claude/

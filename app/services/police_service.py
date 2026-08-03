@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from typing import AsyncContextManager, Callable, Protocol
 
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,11 +56,8 @@ from app.core.config import settings
 from app.core.database import police_session
 from app.core.redis import get_redis
 from app.models.domain import (
-    Booking,
     PoliceMatch,
     PoliceMatchStatus,
-    Room,
-    Tenant,
     WantedPerson,
 )
 from app.services.gov_service import normalize_registry_number
@@ -230,26 +227,30 @@ class PoliceScreeningService:
         under re-check-in and matcher re-runs).
         """
         async with self._session_scope() as session:
-            row = (
+            # Column-minimised projection: hash + correlation ids only. The
+            # police realm has NO table-level SELECT on bookings, so guest
+            # contact details, the arrival PIN and all escrow/commission
+            # state are unreachable here — screening never needed them.
+            candidate = (
                 await session.execute(
-                    select(Booking, Room, Tenant)
-                    .join(Room, Booking.room_id == Room.id)
-                    .join(Tenant, Booking.tenant_id == Tenant.id)
-                    .where(Booking.id == booking_id)
+                    text(
+                        "SELECT booking_id, tenant_id, guest_registry_hash "
+                        "FROM police_screening_candidate(:booking_id)"
+                    ),
+                    {"booking_id": booking_id},
                 )
             ).one_or_none()
-            if row is None:
+            if candidate is None:
                 logger.warning("screening: booking %s not found", booking_id)
                 return None
-            booking, room, tenant = row
 
-            if not booking.guest_registry_hash:
+            if not candidate.guest_registry_hash:
                 return None  # walk-in without an ID document on file
 
             wanted = (
                 await session.execute(
                     select(WantedPerson).where(
-                        WantedPerson.registry_hash == booking.guest_registry_hash,
+                        WantedPerson.registry_hash == candidate.guest_registry_hash,
                         WantedPerson.is_active.is_(True),
                     )
                 )
@@ -265,8 +266,8 @@ class PoliceScreeningService:
                     pg_insert(PoliceMatch)
                     .values(
                         wanted_person_id=wanted.id,
-                        booking_id=booking.id,
-                        tenant_id=booking.tenant_id,
+                        booking_id=candidate.booking_id,
+                        tenant_id=candidate.tenant_id,
                         matched_at=matched_at,
                         status=PoliceMatchStatus.PENDING_REVIEW,
                     )
@@ -279,18 +280,33 @@ class PoliceScreeningService:
             if match_id is None:
                 return None  # already matched previously — no duplicate alert
 
+            # Dispatch details are fetched ONLY now, keyed on the match we
+            # just recorded — a guest who never matched the watchlist never
+            # has their name or room read by this realm.
+            d = (
+                await session.execute(
+                    text(
+                        "SELECT hotel_name, hotel_address, hotel_maps_lat, "
+                        "hotel_maps_lng, room_number, booking_code, "
+                        "guest_full_name "
+                        "FROM police_match_dispatch(:match_id, NULL, 1)"
+                    ),
+                    {"match_id": match_id},
+                )
+            ).one()
+
             alert = PoliceAlert(
                 match_id=str(match_id),
                 matched_at=matched_at.isoformat(),
                 wanted_full_name=wanted.full_name,
                 case_reference=wanted.case_reference,
-                booking_code=booking.code,
-                guest_full_name=booking.guest_full_name,
-                hotel_name=tenant.name,
-                hotel_address=tenant.address,
-                hotel_maps_lat=float(tenant.maps_lat),
-                hotel_maps_lng=float(tenant.maps_lng),
-                room_number=room.room_number,
+                booking_code=d.booking_code,
+                guest_full_name=d.guest_full_name,
+                hotel_name=d.hotel_name,
+                hotel_address=d.hotel_address,
+                hotel_maps_lat=float(d.hotel_maps_lat),
+                hotel_maps_lng=float(d.hotel_maps_lng),
+                room_number=d.room_number,
             )
 
         # Publish AFTER the transaction committed — a dispatcher clicking
