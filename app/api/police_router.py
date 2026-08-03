@@ -23,28 +23,30 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
 from app.core.config import settings
 from app.core.database import police_session
 from app.core.passwords import DUMMY_HASH, verify_password
-from app.core.security import create_access_token
-from app.dependencies.auth import POLICE_ROLE, AuthContext, ScopedSession, require_police
+from app.core.security import create_police_access_token
+from app.dependencies.auth import (
+    POLICE_ROLE,
+    AuthContext,
+    PoliceScopedSession,
+    require_police,
+)
 from app.models.domain import (
-    Booking,
     PoliceAuditLog,
     PoliceMatch,
     PoliceMatchStatus,
     PoliceOfficer,
     PoliceResolutionAction,
-    Room,
-    Tenant,
     WantedPerson,
     WantedPersonStatus,
 )
@@ -205,8 +207,10 @@ async def police_login(body: PoliceLoginRequest) -> PoliceTokenResponse:
             raise invalid
 
         officer.last_login_at = datetime.now(timezone.utc)
-        token = create_access_token(
-            subject=str(officer.id), role=POLICE_ROLE, realm="police"
+        # Minted with the POLICE key/issuer/audience — this token is
+        # rejected by every app-realm endpoint.
+        token = create_police_access_token(
+            subject=str(officer.id), role=POLICE_ROLE
         )
         officer_id, full_name = officer.id, officer.full_name
 
@@ -229,7 +233,7 @@ async def police_login(body: PoliceLoginRequest) -> PoliceTokenResponse:
 async def add_to_watchlist(
     body: WatchlistCreateRequest,
     ctx: PoliceCtx,
-    session: ScopedSession,
+    session: PoliceScopedSession,
 ) -> WantedPersonOut:
     """
     Add a person to the wanted registry.
@@ -286,7 +290,7 @@ async def add_to_watchlist(
 @router.get("/watchlist", response_model=list[WantedPersonOut])
 async def list_watchlist(
     ctx: PoliceCtx,
-    session: ScopedSession,
+    session: PoliceScopedSession,
     person_status: Annotated[
         WantedPersonStatus | None, Query(alias="status")
     ] = None,
@@ -307,57 +311,56 @@ async def list_watchlist(
 # ===========================================================================
 # Matches — GET /police/matches
 # ===========================================================================
-def _to_match_out(
-    match: PoliceMatch,
-    wanted: WantedPerson,
-    tenant: Tenant,
-    room: Room,
-    booking: Booking,
-) -> MatchOut:
+def _to_match_out(row: Any) -> MatchOut:
+    """Map one ``police_match_dispatch`` row onto the API shape."""
     return MatchOut(
-        match_id=match.id,
-        status=match.status,
-        matched_at=match.matched_at,
-        wanted_full_name=wanted.full_name,
-        case_reference=wanted.case_reference,
-        district=wanted.district,
-        wanted_status=wanted.status,
-        hotel_name=tenant.name,
-        hotel_address=tenant.address,
-        hotel_maps_lat=float(tenant.maps_lat),
-        hotel_maps_lng=float(tenant.maps_lng),
-        room_number=room.room_number,
-        booking_code=booking.code,
-        guest_full_name=booking.guest_full_name,
-        check_in_date=booking.check_in_date.isoformat(),
-        check_out_date=booking.check_out_date.isoformat(),
-        reviewed_at=match.reviewed_at,
-        review_note=match.review_note,
+        match_id=row.match_id,
+        status=PoliceMatchStatus(row.match_status),
+        matched_at=row.matched_at,
+        wanted_full_name=row.wanted_full_name,
+        case_reference=row.case_reference,
+        district=row.district,
+        wanted_status=WantedPersonStatus(row.wanted_status),
+        hotel_name=row.hotel_name,
+        hotel_address=row.hotel_address,
+        hotel_maps_lat=float(row.hotel_maps_lat),
+        hotel_maps_lng=float(row.hotel_maps_lng),
+        room_number=row.room_number,
+        booking_code=row.booking_code,
+        guest_full_name=row.guest_full_name,
+        check_in_date=row.check_in_date.isoformat(),
+        check_out_date=row.check_out_date.isoformat(),
+        reviewed_at=row.reviewed_at,
+        review_note=row.review_note,
     )
 
 
 @router.get("/matches", response_model=list[MatchOut])
 async def list_matches(
     ctx: PoliceCtx,
-    session: ScopedSession,
+    session: PoliceScopedSession,
     match_status: PoliceMatchStatus | None = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> list[MatchOut]:
     """Match feed for the dispatch dashboard, newest first — now including
-    the wanted person's district alongside hotel + room."""
-    query = (
-        select(PoliceMatch, WantedPerson, Tenant, Room, Booking)
-        .join(WantedPerson, PoliceMatch.wanted_person_id == WantedPerson.id)
-        .join(Booking, PoliceMatch.booking_id == Booking.id)
-        .join(Room, Booking.room_id == Room.id)
-        .join(Tenant, PoliceMatch.tenant_id == Tenant.id)
-        .order_by(PoliceMatch.matched_at.desc())
-        .limit(limit)
-    )
-    if match_status is not None:
-        query = query.where(PoliceMatch.status == match_status)
-    rows = (await session.execute(query)).all()
-    return [_to_match_out(*row) for row in rows]
+    the wanted person's district alongside hotel + room.
+
+    Reads the fixed ``police_match_dispatch`` projection rather than joining
+    ``bookings``/``rooms``/``tenants`` directly: the police realm holds no
+    table-level SELECT on those, and dispatch data exists only for bookings
+    that actually matched the watchlist."""
+    rows = (
+        await session.execute(
+            text(
+                "SELECT * FROM police_match_dispatch(NULL, :status, :limit)"
+            ),
+            {
+                "status": match_status.value if match_status else None,
+                "limit": limit,
+            },
+        )
+    ).all()
+    return [_to_match_out(row) for row in rows]
 
 
 # ===========================================================================
@@ -376,7 +379,7 @@ async def resolve_match(
     match_id: uuid.UUID,
     body: ResolveRequest,
     ctx: PoliceCtx,
-    session: ScopedSession,
+    session: PoliceScopedSession,
 ) -> ResolveResponse:
     """
     Resolve a PENDING_REVIEW match with an officer action. Single-shot: a
@@ -438,7 +441,7 @@ async def resolve_match(
 @router.get("/audit-logs", response_model=list[AuditLogOut])
 async def list_audit_logs(
     ctx: PoliceCtx,
-    session: ScopedSession,
+    session: PoliceScopedSession,
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
 ) -> list[AuditLogOut]:
     """The append-only officer-action trail, newest first. Joins the actor

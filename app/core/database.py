@@ -1,13 +1,26 @@
 """
 Async database engines, session factories and RLS context injection.
 
-Two engines, two identities
-===========================
+Three engines, three DB login roles
+===================================
 *   **App engine** — connects as ``app_runtime``. Every Row-Level-Security
     policy applies; a session sees nothing until its identity GUCs are set.
-*   **Police engine** — connects as ``police_runtime`` with credentials the
-    app process does not need to know in production. Only this engine can
-    reach ``wanted_persons`` / ``police_matches``.
+    This role has NO privileges on the platform wallet/ledger tables.
+*   **Platform engine** — connects as ``platform_runtime``. Cross-tenant
+    workflows (escrow, reconciliation, admin reporting, platform-orchestrated
+    guest writes). ``app_is_platform_admin()`` requires this login role, so
+    platform privilege cannot be self-asserted from a tenant connection.
+*   **Police engine** — connects as ``police_runtime``. Only this engine can
+    reach ``wanted_persons`` / ``police_matches``, and it reads business data
+    exclusively through fixed SECURITY DEFINER projections.
+
+Boundary caveat (do not overstate this)
+---------------------------------------
+Separate DB roles defend against SQL injection and against a leaked
+credential for ONE role. They do NOT defend against compromise of the
+application host: this process can read every DSN in its own environment.
+Realm separation at the process/deployment level is a deployment concern
+tracked in the architecture docs, not something this module provides.
 
 RLS context (``set_config`` GUCs)
 =================================
@@ -63,6 +76,33 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return ORM objects/DTOs after their transaction commits; implicit
     lazy refreshes would then explode."""
     return async_sessionmaker(get_engine(), expire_on_commit=False)
+
+
+@lru_cache(maxsize=1)
+def get_platform_engine() -> AsyncEngine:
+    """
+    Platform-realm engine — connects as ``platform_runtime``.
+
+    The RLS predicate ``app_is_platform_admin()`` requires
+    ``session_user = 'platform_runtime'``, so cross-tenant visibility is a
+    property of the DB LOGIN ROLE, not of a session variable a tenant
+    connection could set for itself. SQL injection inside a tenant request,
+    or a leaked ``app_runtime`` password, therefore cannot reach platform
+    data by flipping ``app.user_role``.
+    """
+    return create_async_engine(
+        settings.PLATFORM_DATABASE_URL,
+        echo=settings.DB_ECHO,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_recycle=settings.DB_POOL_RECYCLE_SECONDS,
+        pool_pre_ping=True,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_platform_session_factory() -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(get_platform_engine(), expire_on_commit=False)
 
 
 @lru_cache(maxsize=1)
@@ -148,8 +188,13 @@ async def platform_session() -> AsyncIterator[AsyncSession]:
     Used by system workflows that legitimately cross tenant boundaries —
     escrow settlement, subscription billing, reconciliation. Never expose
     this to request handlers acting on behalf of hotel/restaurant users.
+
+    Runs on the SEPARATE ``platform_runtime`` engine. Both halves of the
+    identity are required by the RLS predicate: the login role (which a
+    tenant connection cannot assume) and the role GUC (which scopes intent
+    within this connection).
     """
-    async with get_session_factory()() as session:
+    async with get_platform_session_factory()() as session:
         async with session.begin():
             await set_rls_context(session, realm="app", user_role="PLATFORM_ADMIN")
             yield session

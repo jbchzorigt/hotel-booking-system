@@ -29,10 +29,17 @@ _ENV_DEFAULTS = {
     "POSTGRES_HOST": "localhost",
     "POSTGRES_PORT": "55440",
     "POSTGRES_USER": "app_runtime",
-    "POSTGRES_PASSWORD": "CHANGE_ME_IN_PRODUCTION",
+    "POSTGRES_PASSWORD": "local-dev-app-runtime-pw",
     "POSTGRES_DB": "hotel_marketplace_test",
+    # Distinct login roles — the suite exercises the REAL privilege
+    # separation, not a single superuser pretending to be three realms.
+    "POSTGRES_PLATFORM_USER": "platform_runtime",
+    "POSTGRES_PLATFORM_PASSWORD": "local-dev-platform-runtime-pw",
     "POSTGRES_POLICE_USER": "police_runtime",
-    "POSTGRES_POLICE_PASSWORD": "CHANGE_ME_IN_PRODUCTION",
+    "POSTGRES_POLICE_PASSWORD": "local-dev-police-runtime-pw",
+    # Realm-separated JWT signing keys (see app/core/security.py).
+    "JWT_SECRET_KEY": "test-app-jwt-secret-key-not-for-production",
+    "POLICE_JWT_SECRET_KEY": "test-police-jwt-secret-key-not-for-production",
     # Keep the background janitor effectively dormant during the run so its
     # sweep never races the explicit janitor assertions (Phase G).
     "JANITOR_INTERVAL_SECONDS": "3600",
