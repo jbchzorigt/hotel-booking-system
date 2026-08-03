@@ -77,6 +77,20 @@ jobs:
       - name: Apply migrations to a fresh database (schema + RLS + roles)
         run: alembic upgrade head
 
+      # Migrations CREATE the runtime login roles but deliberately never set
+      # usable passwords — a source-controlled migration must not carry a
+      # credential, so roles are created with a placeholder. CI therefore has
+      # to assign the same throwaway passwords the suite expects, exactly as a
+      # developer does locally (see BACKEND_README step 4b). Without this the
+      # suite cannot authenticate as app_runtime / platform_runtime /
+      # police_runtime and every test fails with InvalidPasswordError.
+      - name: Provision runtime role passwords (CI/local placeholders only)
+        env:
+          PGPASSWORD: PyJQHYDjvBWevPD46KVV25Z5OFdS055O
+        run: |
+          psql -h localhost -p 55440 -U hotel -d hotel_marketplace_test \
+               -v ON_ERROR_STOP=1 -f scripts/provision_local_roles.sql
+
       - name: Run E2E test suite
         run: pytest -q
 
